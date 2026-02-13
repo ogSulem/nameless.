@@ -165,7 +165,7 @@ async def reg_birth_date(message: Message, state: FSMContext, redis: Redis) -> N
                 "Укажи город или выбери глобальный поиск:",
             )
             if not ok:
-                raise TelegramBadRequest("edit_failed")
+                raise Exception("edit_failed")
             try:
                 await safe_edit_message_reply_markup(
                     message.bot,
@@ -176,7 +176,7 @@ async def reg_birth_date(message: Message, state: FSMContext, redis: Redis) -> N
             except TelegramBadRequest:
                 pass
             return
-        except TelegramBadRequest:
+        except Exception:
             logger.error("reg_birth_date_edit_city_failed_unexpected tg_id=%s mid=%s", message.from_user.id, mid)
 
         await safe_delete_message(message.bot, tg_id, mid)
