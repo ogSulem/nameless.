@@ -31,6 +31,21 @@ class AIService:
         self._mp_face_detector_error: str | None = None
         self._mp_lock = threading.Lock()
 
+        self._vision_max_side = 512
+
+    def _resize_max_side(self, bgr: np.ndarray) -> np.ndarray:
+        max_side = int(self._vision_max_side or 0)
+        if max_side <= 0:
+            return bgr
+        h, w = bgr.shape[:2]
+        m = max(h, w)
+        if m <= max_side:
+            return bgr
+        scale = float(max_side) / float(m)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     async def _get_insight_model(self) -> Any | None:
         """Lazy-init InsightFace model once per process. Returns None if unavailable."""
         if AIService._insight_model is not None:
@@ -87,7 +102,6 @@ class AIService:
     async def detect_human_with_meta(self, photo_bytes: bytes) -> tuple[bool, dict[str, Any]]:
         """Like detect_human(), but also returns debugging metadata for admin channel."""
         try:
-            model = await self._get_insight_model()
             loop = asyncio.get_event_loop()
 
             def sync_detect() -> tuple[bool, dict[str, Any]]:
@@ -98,34 +112,18 @@ class AIService:
 
                 h, w = image.shape[:2]
 
-                # 1) InsightFace first (preferred)
-                if model is not None:
-                    try:
-                        with AIService._insight_detect_lock:
-                            faces = model.get(image)
-                        return (
-                            len(faces) > 0,
-                            {
-                                "backend": "insightface_buffalo_l",
-                                "faces": int(len(faces)),
-                                "w": int(w),
-                                "h": int(h),
-                                "error": None,
-                            },
-                        )
-                    except Exception as e:
-                        # fall back to OpenCV
-                        insight_err = str(e)
-                else:
-                    insight_err = AIService._insight_init_error
+                # Resize for speed/consistency with bench (keeps enough detail for "face vs no face")
+                image_det = self._resize_max_side(image)
 
-                # 2) Optional MediaPipe backend (only if mp.solutions exists in this environment)
+                insight_err: str | None = None
+
+                # 1) MediaPipe backend (fast & accurate; preferred if available)
                 try:
                     import mediapipe as mp  # type: ignore
 
                     if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
                         mp_face_detection = mp.solutions.face_detection
-                        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                        rgb_image = cv2.cvtColor(image_det, cv2.COLOR_BGR2RGB)
 
                         with self._mp_lock:
                             if self._mp_face_detector is None and self._mp_face_detector_error is None:
@@ -173,11 +171,33 @@ class AIService:
                             )
                 except Exception as e:
                     # Ignore: environment may not have mediapipe or mp.solutions
-                    if not insight_err:
+                    insight_err = str(e)
+
+                # 2) InsightFace fallback (accurate, but may be unavailable and may download models on first use)
+                # NOTE: Do not start InsightFace initialization here.
+                # This function runs in a worker thread and must not touch the event loop.
+                # Also, triggering downloads during message handling is undesirable for latency.
+                model = AIService._insight_model
+
+                if model is not None:
+                    try:
+                        with AIService._insight_detect_lock:
+                            faces = model.get(image_det)
+                        return (
+                            len(faces) > 0,
+                            {
+                                "backend": "insightface_buffalo_l",
+                                "faces": int(len(faces)),
+                                "w": int(w),
+                                "h": int(h),
+                                "error": None,
+                            },
+                        )
+                    except Exception as e:
                         insight_err = str(e)
 
                 # 3) Strict OpenCV fallback
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                gray = cv2.cvtColor(image_det, cv2.COLOR_BGR2GRAY)
                 min_dim = min(w, h)
                 min_size = max(30, int(min_dim * 0.12))
 
