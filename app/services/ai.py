@@ -14,6 +14,7 @@ class AIService:
     _insight_init_error: str | None = None
     _insight_init_lock: asyncio.Lock | None = None
     _insight_detect_lock = threading.Lock()
+    _insight_init_started: bool = False
 
     def __init__(self, api_key: str | None = None):
         # Local, fast, and reliable face detection.
@@ -33,6 +34,25 @@ class AIService:
         if AIService._insight_init_error is not None:
             return None
 
+        # Never block the caller: start init in background and return None until ready.
+        await self._ensure_insight_init_started()
+        return AIService._insight_model
+
+    async def _ensure_insight_init_started(self) -> None:
+        if AIService._insight_init_started or AIService._insight_model is not None or AIService._insight_init_error is not None:
+            return
+
+        AIService._insight_init_started = True
+        try:
+            asyncio.create_task(self._init_insight_model_background())
+        except Exception:
+            # If we can't schedule a task, allow fallback permanently.
+            AIService._insight_init_error = "schedule_failed"
+
+    async def _init_insight_model_background(self) -> None:
+        if AIService._insight_model is not None or AIService._insight_init_error is not None:
+            return
+
         if AIService._insight_init_lock is None:
             AIService._insight_init_lock = asyncio.Lock()
 
@@ -40,21 +60,25 @@ class AIService:
             if AIService._insight_model is not None:
                 return AIService._insight_model
             if AIService._insight_init_error is not None:
-                return None
+                return
 
             try:
-                import insightface  # type: ignore
+                def sync_init() -> Any:
+                    import insightface  # type: ignore
 
-                model = insightface.app.FaceAnalysis(name="buffalo_l")
-                # ctx_id=-1 forces CPU.
-                model.prepare(ctx_id=-1, providers=["CPUExecutionProvider"])
+                    model = insightface.app.FaceAnalysis(name="buffalo_l")
+                    # ctx_id=-1 forces CPU.
+                    model.prepare(ctx_id=-1, providers=["CPUExecutionProvider"])
+                    return model
+
+                loop = asyncio.get_event_loop()
+                model = await loop.run_in_executor(None, sync_init)
                 AIService._insight_model = model
                 logger.info("insightface_ready")
-                return model
             except Exception as e:
                 AIService._insight_init_error = str(e)
                 logger.exception("insightface_init_failed")
-                return None
+                return
 
     async def detect_human_with_meta(self, photo_bytes: bytes) -> tuple[bool, dict[str, Any]]:
         """Like detect_human(), but also returns debugging metadata for admin channel."""

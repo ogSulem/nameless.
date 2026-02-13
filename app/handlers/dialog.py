@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -266,7 +267,15 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                 
                 # Call AI Service (offline)
                 ai_service = AIService()
-                is_human, ai_meta = await ai_service.detect_human_with_meta(dest.read())
+                photo_bytes = dest.read()
+                try:
+                    is_human, ai_meta = await asyncio.wait_for(
+                        ai_service.detect_human_with_meta(photo_bytes),
+                        timeout=4.0,
+                    )
+                except asyncio.TimeoutError:
+                    is_human = False
+                    ai_meta = {"backend": "timeout", "error": "detect_timeout"}
                 if is_human:
                     has_human = True
                     # Remember that this sender has sent a human photo in this dialog
@@ -354,11 +363,14 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
             
             logger.info("forward_photo_to_admin attempt chat_id=%s", target_chat_id)
 
-            await message.bot.send_photo(
-                chat_id=target_chat_id,
-                photo=message.photo[-1].file_id,
-                caption=caption
-            )
+            try:
+                await message.bot.send_photo(
+                    chat_id=target_chat_id,
+                    photo=message.photo[-1].file_id,
+                    caption=caption,
+                )
+            except Exception:
+                logger.exception("failed_send_photo_to_admin alerts_chat_id=%s", settings.alerts_chat_id)
         except Exception:
             logger.exception("failed_forward_photo_to_admin alerts_chat_id=%s", settings.alerts_chat_id)
 
