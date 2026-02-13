@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     media_root: str = Field(default="/app/media", alias="MEDIA_ROOT")
 
+    vision_min_conf: float = Field(default=0.7, alias="VISION_MIN_CONF")
+    vision_max_side: int = Field(default=640, alias="VISION_MAX_SIDE")
+    vision_timeout_s: float = Field(default=4.0, alias="VISION_TIMEOUT_S")
+    vision_concurrency: int = Field(default=2, alias="VISION_CONCURRENCY")
+
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     hf_token: str | None = Field(default=None, alias="HF_TOKEN")
 

@@ -195,14 +195,14 @@ class MatchmakingService:
                 # Reset rating/appearance-related state for a fresh dialog.
                 # This prevents leaking pending steps/flags between different partners.
                 for tg in (user.telegram_id, partner.telegram_id):
-                    await self._redis.delete(f"pending_rating:{tg}")
-                    await self._redis.delete(f"pending_rating_has_photos:{tg}")
-                    await self._redis.delete(f"pending_rating_partner:{tg}")
-                    await self._redis.delete(f"pending_rating_action:{tg}")
-                    await self._redis.delete(f"pending_rating_step:{tg}")
+                    await self._redis.delete(keys.pending_rating(tg))
+                    await self._redis.delete(keys.pending_rating_has_photos(tg))
+                    await self._redis.delete(keys.pending_rating_partner(tg))
+                    await self._redis.delete(keys.pending_rating_action(tg))
+                    await self._redis.delete(keys.pending_rating_step(tg))
 
-                await self._redis.delete(f"appearance_rating_required:{user.telegram_id}:{dialog.id}")
-                await self._redis.delete(f"appearance_rating_required:{partner.telegram_id}:{dialog.id}")
+                await self._redis.delete(keys.appearance_rating_required(user.telegram_id, dialog.id))
+                await self._redis.delete(keys.appearance_rating_required(partner.telegram_id, dialog.id))
             except Exception:
                 logger.exception("failed_set_active_dialog_cache user_tg=%s partner_tg=%s", user.telegram_id, partner.telegram_id)
 

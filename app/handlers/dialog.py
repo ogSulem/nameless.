@@ -28,7 +28,17 @@ logger = logging.getLogger(__name__)
 router = Router(name="dialog")
 
 _AI_SERVICE = AIService()
-_AI_DETECT_SEMAPHORE = asyncio.Semaphore(2)
+_AI_DETECT_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_ai_semaphore(settings: Settings) -> asyncio.Semaphore:
+    global _AI_DETECT_SEMAPHORE
+    if _AI_DETECT_SEMAPHORE is None:
+        n = int(getattr(settings, "vision_concurrency", 2) or 2)
+        if n <= 0:
+            n = 1
+        _AI_DETECT_SEMAPHORE = asyncio.Semaphore(n)
+    return _AI_DETECT_SEMAPHORE
 
 async def _get_dialog_id(redis: Redis, tg_id: int) -> int | None:
     v = await redis.get(keys.active_dialog(tg_id))
@@ -86,19 +96,19 @@ async def _finish_and_request_rating(
         if not t: continue
         await redis.delete(keys.active_dialog(t))
         
-        await redis.set(f"pending_rating:{t}", str(dialog_id), ex=60 * 60)
+        await redis.set(keys.pending_rating(t), str(dialog_id), ex=60 * 60)
         
         # Appearance rating logic: only if the OTHER person sent a photo with a human
         other_tg = tg2 if t == tg1 else tg1
-        has_human_photo = await redis.get(f"appearance_rating_required:{t}:{dialog_id}")
+        has_human_photo = await redis.get(keys.appearance_rating_required(t, dialog_id))
         
         hp = "1" if has_human_photo else "0"
-        await redis.set(f"pending_rating_has_photos:{t}", hp, ex=60 * 60)
-        await redis.set(f"pending_rating_step:{t}", "chat", ex=60 * 60)
+        await redis.set(keys.pending_rating_has_photos(t), hp, ex=60 * 60)
+        await redis.set(keys.pending_rating_step(t), "chat", ex=60 * 60)
 
     if tg1 and tg2:
-        await redis.set(f"pending_rating_partner:{tg1}", str(tg2), ex=60 * 60)
-        await redis.set(f"pending_rating_partner:{tg2}", str(tg1), ex=60 * 60)
+        await redis.set(keys.pending_rating_partner(tg1), str(tg2), ex=60 * 60)
+        await redis.set(keys.pending_rating_partner(tg2), str(tg1), ex=60 * 60)
 
         # 2. Assign actions
         a1 = action
@@ -110,8 +120,8 @@ async def _finish_and_request_rating(
             else:
                 a1, a2 = "skip", "end"
         
-        await redis.set(f"pending_rating_action:{tg1}", a1, ex=60 * 60)
-        await redis.set(f"pending_rating_action:{tg2}", a2, ex=60 * 60)
+        await redis.set(keys.pending_rating_action(tg1), a1, ex=60 * 60)
+        await redis.set(keys.pending_rating_action(tg2), a2, ex=60 * 60)
 
     # 3. Send "Dialog finished" message to BOTH with reply keyboard /start
     start_kb = get_start_kb()
@@ -134,7 +144,7 @@ async def _finish_and_request_rating(
                 "Оцени общение (0-10):",
                 kb=complaint_only_kb(),
             )
-            await redis.set(f"ui:rating_message_id:{t}", str(msg.message_id), ex=60 * 60)
+            await redis.set(keys.ui_rating_message_id(t), str(msg.message_id), ex=60 * 60)
             logger.info("SENT_RATING_UI_OK tg=%s mid=%s", t, msg.message_id)
         except Exception:
             logger.exception("FAILED_SEND_RATING_UI tg=%s", t)
@@ -254,7 +264,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
         ai_meta: dict[str, Any] | None = None
         try:
             # Check if we already detected a human from this sender in this dialog to save CPU
-            redis_key = f"dialog:{dialog_id}:sender:{message.from_user.id}:human_detected"
+            redis_key = keys.dialog_sender_human_detected(dialog_id, message.from_user.id)
             already_detected = await redis.get(redis_key)
             
             if already_detected == "1":
@@ -271,10 +281,12 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                 # Call AI Service (offline)
                 photo_bytes = dest.read()
                 try:
-                    async with _AI_DETECT_SEMAPHORE:
+                    _AI_SERVICE.configure_from_settings(settings)
+                    sem = _get_ai_semaphore(settings)
+                    async with sem:
                         is_human, ai_meta = await asyncio.wait_for(
                             _AI_SERVICE.detect_human_with_meta(photo_bytes),
-                            timeout=4.0,
+                            timeout=float(getattr(settings, "vision_timeout_s", 4.0) or 4.0),
                         )
                 except asyncio.TimeoutError:
                     is_human = False
@@ -289,7 +301,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                     cur_sender_dialog = await redis.get(keys.active_dialog(message.from_user.id))
                     cur_partner_dialog = await redis.get(keys.active_dialog(partner_tg))
                     if cur_sender_dialog and cur_partner_dialog and int(cur_sender_dialog) == int(dialog_id) and int(cur_partner_dialog) == int(dialog_id):
-                        await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
+                        await redis.set(keys.appearance_rating_required(partner_tg, dialog_id), "1", ex=3600)
                         logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
                     else:
                         logger.info(
@@ -303,7 +315,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
 
             if ai_meta is not None:
                 logger.info(
-                    "ai_face_verdict dialog_id=%s from_tg=%s to_tg=%s verdict=%s backend=%s faces=%s eyes=%s size=%sx%s cached=%s err=%s insight_err=%s",
+                    "ai_face_verdict dialog_id=%s from_tg=%s to_tg=%s verdict=%s backend=%s faces=%s eyes=%s size=%sx%s cached=%s ms=%s err=%s insight_err=%s",
                     dialog_id,
                     message.from_user.id,
                     partner_tg,
@@ -314,6 +326,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                     ai_meta.get("w"),
                     ai_meta.get("h"),
                     1 if ai_meta.get("cached") else 0,
+                    ai_meta.get("duration_ms"),
                     ai_meta.get("error"),
                     ai_meta.get("insight_error") or ai_meta.get("insight_init_error"),
                 )

@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
 from aiogram.fsm.storage.redis import RedisStorage
 
 from app.config import Settings
@@ -61,6 +61,11 @@ async def main() -> None:
             await dp.start_polling(bot)
             logger.info("polling_stopped")
             delay_s = 1
+        except TelegramConflictError as e:
+            # Happens when multiple bot instances use long polling (getUpdates) at once.
+            # In production, you must ensure only one instance is running.
+            logger.exception("telegram_conflict_error: %s", e)
+            delay_s = max(delay_s, 15)
         except (TelegramNetworkError, ConnectionResetError) as e:
             logger.exception("telegram_network_error: %s", e)
         except Exception as e:

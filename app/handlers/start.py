@@ -53,7 +53,7 @@ async def _handle_start(message: Message, session: AsyncSession, state: FSMConte
             pass
         return
 
-    pending_rating = await redis.get(f"pending_rating:{tg_id}")
+    pending_rating = await redis.get(keys.pending_rating(tg_id))
     if pending_rating:
         try:
             await message.delete()
@@ -62,7 +62,7 @@ async def _handle_start(message: Message, session: AsyncSession, state: FSMConte
         return
 
     dialog_id_raw = await redis.get(keys.active_dialog(tg_id))
-    searching_msg_id = await redis.get(f"ui:search_message_id:{tg_id}")
+    searching_msg_id = await redis.get(keys.ui_search_message_id(tg_id))
     if dialog_id_raw or searching_msg_id:
         try:
             await message.delete()

@@ -44,7 +44,7 @@ def _b2s(v: str | bytes | None) -> str | None:
 
 
 def _rating_message_key(tg_id: int) -> str:
-    return f"ui:rating_message_id:{tg_id}"
+    return keys.ui_rating_message_id(tg_id)
 
 
 async def _get_rating_message_id(redis: Redis, tg_id: int) -> int | None:
@@ -71,32 +71,32 @@ async def _edit_rating_message(bot, redis: Redis, tg_id: int, text: str, reply_m
 
 
 async def _clear_pending(redis: Redis, tg_id: int) -> None:
-    await redis.delete(f"pending_rating:{tg_id}")
-    await redis.delete(f"pending_rating_has_photos:{tg_id}")
-    await redis.delete(f"pending_rating_partner:{tg_id}")
-    await redis.delete(f"pending_rating_action:{tg_id}")
-    await redis.delete(f"pending_rating_step:{tg_id}")
+    await redis.delete(keys.pending_rating(tg_id))
+    await redis.delete(keys.pending_rating_has_photos(tg_id))
+    await redis.delete(keys.pending_rating_partner(tg_id))
+    await redis.delete(keys.pending_rating_action(tg_id))
+    await redis.delete(keys.pending_rating_step(tg_id))
     await redis.delete(_rating_message_key(tg_id))
 
 
 async def _pending_dialog(redis: Redis, tg_id: int) -> tuple[int | None, bool]:
-    d = _b2s(await redis.get(f"pending_rating:{tg_id}"))
-    hp = _b2s(await redis.get(f"pending_rating_has_photos:{tg_id}"))
+    d = _b2s(await redis.get(keys.pending_rating(tg_id)))
+    hp = _b2s(await redis.get(keys.pending_rating_has_photos(tg_id)))
     return (int(d) if d else None, hp == "1")
 
 
 async def _pending_action(redis: Redis, tg_id: int) -> str:
-    v = _b2s(await redis.get(f"pending_rating_action:{tg_id}"))
+    v = _b2s(await redis.get(keys.pending_rating_action(tg_id)))
     return v or "end"
 
 
 async def _get_search_message_id(redis: Redis, tg_id: int) -> int | None:
-    v = await redis.get(f"ui:search_message_id:{tg_id}")
+    v = await redis.get(keys.ui_search_message_id(tg_id))
     return int(v) if v else None
 
 
 async def _clear_search_message_id(redis: Redis, tg_id: int) -> None:
-    await redis.delete(f"ui:search_message_id:{tg_id}")
+    await redis.delete(keys.ui_search_message_id(tg_id))
 
 
 def _age(birth_date: date) -> int:
@@ -124,13 +124,13 @@ async def _continue_after_rating_tg(bot, tg_id: int, session: AsyncSession, redi
                 ok = await safe_edit_message_text(bot, tg_id, mid, "Ищу собеседника...", reply_markup=cancel_search_kb())
                 if not ok:
                     raise Exception("edit_failed")
-                await redis.set(f"ui:search_message_id:{tg_id}", str(mid), ex=60 * 60 * 24 * 30)
+                await redis.set(keys.ui_search_message_id(tg_id), str(mid), ex=60 * 60 * 24 * 30)
             else:
                 msg = await send_new_ui(bot, redis, tg_id, "Ищу собеседника...", kb=cancel_search_kb())
-                await redis.set(f"ui:search_message_id:{tg_id}", str(msg.message_id), ex=60 * 60 * 24 * 30)
+                await redis.set(keys.ui_search_message_id(tg_id), str(msg.message_id), ex=60 * 60 * 24 * 30)
         except Exception:
             msg = await send_new_ui(bot, redis, tg_id, "Ищу собеседника...", kb=cancel_search_kb())
-            await redis.set(f"ui:search_message_id:{tg_id}", str(msg.message_id), ex=60 * 60 * 24 * 30)
+            await redis.set(keys.ui_search_message_id(tg_id), str(msg.message_id), ex=60 * 60 * 24 * 30)
 
         res = await session.execute(select(User).where(User.telegram_id == tg_id))
         user = res.scalar_one_or_none()
@@ -203,7 +203,7 @@ def _parse_rating(text: str | None) -> int | None:
 
 
 async def _pending_step(redis: Redis, tg_id: int) -> str:
-    v = _b2s(await redis.get(f"pending_rating_step:{tg_id}"))
+    v = _b2s(await redis.get(keys.pending_rating_step(tg_id)))
     return v or "chat"
 
 
@@ -238,7 +238,7 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
         "rating_message_received tg=%s dialog_id=%s step_key=%s text=%r",
         message.from_user.id,
         dialog_id,
-        await redis.get(f"pending_rating_step:{message.from_user.id}"),
+        await redis.get(keys.pending_rating_step(message.from_user.id)),
         message.text,
     )
 
@@ -261,7 +261,7 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
     if from_user_id is None:
         return
 
-    to_tg = await redis.get(f"pending_rating_partner:{message.from_user.id}")
+    to_tg = await redis.get(keys.pending_rating_partner(message.from_user.id))
     to_user_id = None
     if to_tg:
         res2 = await session.execute(select(User.id).where(User.telegram_id == int(to_tg)))
@@ -350,9 +350,9 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
             except Exception:
                 logger.exception("failed_notify_admin_drop admin=%s", admin_id)
 
-    hp = _b2s(await redis.get(f"pending_rating_has_photos:{message.from_user.id}"))
+    hp = _b2s(await redis.get(keys.pending_rating_has_photos(message.from_user.id)))
     if step == "chat" and hp == "1":
-        await redis.set(f"pending_rating_step:{message.from_user.id}", "appearance", ex=60 * 60)
+        await redis.set(keys.pending_rating_step(message.from_user.id), "appearance", ex=60 * 60)
         await _edit_rating_message(message.bot, redis, message.from_user.id, "Введи рейтинг по внешности от 0 до 10:")
         logger.info("rated_chat dialog_id=%s from=%s", dialog_id, message.from_user.id)
         return

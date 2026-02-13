@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import threading
+import time
 import numpy as np
 import cv2
 from typing import Any
@@ -32,6 +33,22 @@ class AIService:
         self._mp_lock = threading.Lock()
 
         self._vision_max_side = 640
+        self._vision_min_conf = 0.7
+
+    def configure_from_settings(self, settings: Any) -> None:
+        try:
+            v = float(getattr(settings, "vision_min_conf", 0.7) or 0.7)
+            if 0.0 < v < 1.0:
+                self._vision_min_conf = v
+        except Exception:
+            pass
+
+        try:
+            m = int(getattr(settings, "vision_max_side", 640) or 640)
+            if m >= 128:
+                self._vision_max_side = m
+        except Exception:
+            pass
 
     def _resize_max_side(self, bgr: np.ndarray) -> np.ndarray:
         max_side = int(self._vision_max_side or 0)
@@ -105,10 +122,11 @@ class AIService:
             loop = asyncio.get_event_loop()
 
             def sync_detect() -> tuple[bool, dict[str, Any]]:
+                t0 = time.perf_counter()
                 nparr = np.frombuffer(photo_bytes, np.uint8)
                 image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if image is None:
-                    return (False, {"backend": "decode", "error": "decode_failed"})
+                    return (False, {"backend": "decode", "error": "decode_failed", "duration_ms": int((time.perf_counter() - t0) * 1000)})
 
                 h, w = image.shape[:2]
 
@@ -130,7 +148,7 @@ class AIService:
                                 try:
                                     self._mp_face_detector = mp_face_detection.FaceDetection(
                                         model_selection=0,
-                                        min_detection_confidence=0.7,
+                                        min_detection_confidence=float(self._vision_min_conf),
                                     )
                                 except Exception as e:
                                     self._mp_face_detector_error = str(e)
@@ -151,7 +169,7 @@ class AIService:
                             for det in detections:
                                 cnt += 1
                                 try:
-                                    if det.score and det.score[0] >= 0.7:
+                                    if det.score and det.score[0] >= float(self._vision_min_conf):
                                         score_ok = True
                                 except Exception:
                                     pass
@@ -163,11 +181,12 @@ class AIService:
                             {
                                 "backend": "mediapipe_face_detection",
                                 "faces": int(cnt),
-                                "min_conf": 0.7,
+                                "min_conf": float(self._vision_min_conf),
                                 "model_selection": 0,
                                 "w": int(w),
                                 "h": int(h),
                                 "error": None,
+                                "duration_ms": int((time.perf_counter() - t0) * 1000),
                             },
                         )
                 except Exception as e:
@@ -192,6 +211,7 @@ class AIService:
                                 "w": int(w),
                                 "h": int(h),
                                 "error": None,
+                                "duration_ms": int((time.perf_counter() - t0) * 1000),
                             },
                         )
                     except Exception as e:
@@ -235,6 +255,7 @@ class AIService:
                     "w": int(w),
                     "h": int(h),
                     "error": None,
+                    "duration_ms": int((time.perf_counter() - t0) * 1000),
                 }
                 if insight_err:
                     meta["insight_error"] = insight_err

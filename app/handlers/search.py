@@ -16,6 +16,7 @@ from app.keyboards.search import cancel_search_kb
 from app.keyboards.search import search_kb
 from app.services.matchmaking import MatchmakingService
 from app.flows.profile import show_profile
+from app.redis import keys
 from app.ui import edit_ui, get_ui_message_id, send_new_ui
 from app.telegram_safe import safe_delete_message
 
@@ -24,7 +25,7 @@ router = Router(name="search")
 
 
 def _search_message_key(tg_id: int) -> str:
-    return f"ui:search_message_id:{tg_id}"
+    return keys.ui_search_message_id(tg_id)
 
 
 async def _get_search_message_id(redis: Redis, tg_id: int) -> int | None:
