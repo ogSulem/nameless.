@@ -91,7 +91,48 @@ class AIService:
                 else:
                     insight_err = AIService._insight_init_error
 
-                # 2) Strict OpenCV fallback
+                # 2) Optional MediaPipe backend (only if mp.solutions exists in this environment)
+                try:
+                    import mediapipe as mp  # type: ignore
+
+                    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+                        mp_face_detection = mp.solutions.face_detection
+                        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                        with mp_face_detection.FaceDetection(
+                            model_selection=1,
+                            min_detection_confidence=0.65,
+                        ) as detector:
+                            results = detector.process(rgb_image)
+
+                        detections = getattr(results, "detections", None) if results is not None else None
+                        score_ok = False
+                        cnt = 0
+                        if detections:
+                            for det in detections:
+                                cnt += 1
+                                try:
+                                    if det.score and det.score[0] > 0.65:
+                                        score_ok = True
+                                except Exception:
+                                    pass
+
+                        if score_ok:
+                            return (
+                                True,
+                                {
+                                    "backend": "mediapipe_face_detection",
+                                    "faces": int(cnt),
+                                    "w": int(w),
+                                    "h": int(h),
+                                    "error": None,
+                                },
+                            )
+                except Exception as e:
+                    # Ignore: environment may not have mediapipe or mp.solutions
+                    if not insight_err:
+                        insight_err = str(e)
+
+                # 3) Strict OpenCV fallback
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 min_dim = min(w, h)
                 min_size = max(30, int(min_dim * 0.12))
