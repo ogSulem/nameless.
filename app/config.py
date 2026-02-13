@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     redis_host: str | None = Field(default=None, alias="REDIS_HOST")
     redis_port: int | None = Field(default=None, alias="REDIS_PORT")
     redis_db: int = Field(default=0, alias="REDIS_DB")
+    redis_username: str | None = Field(default=None, alias="REDIS_USERNAME")
     redis_password: str | None = Field(default=None, alias="REDIS_PASSWORD")
     redis_url: str | None = Field(default=None, alias="REDIS_URL")
 

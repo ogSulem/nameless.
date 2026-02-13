@@ -31,6 +31,7 @@ async def main() -> None:
         settings.redis_host, 
         settings.redis_port, 
         settings.redis_db, 
+        settings.redis_username,
         settings.redis_password,
         settings.redis_url
     )
