@@ -244,79 +244,77 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
         except Exception:
             logger.exception("relay_photo_failed dialog_id=%s from_tg=%s to_tg=%s", dialog_id, message.from_user.id, partner_tg)
 
-        # AI Vision check: only if HF_TOKEN is present
+        # AI Vision check: offline face detection (OpenCV)
         has_human = False
-        if settings.hf_token:
-            try:
-                # Check if we already detected a human from this sender in this dialog to save API calls
-                redis_key = f"dialog:{dialog_id}:sender:{message.from_user.id}:human_detected"
-                already_detected = await redis.get(redis_key)
+        try:
+            # Check if we already detected a human from this sender in this dialog to save CPU
+            redis_key = f"dialog:{dialog_id}:sender:{message.from_user.id}:human_detected"
+            already_detected = await redis.get(redis_key)
+            
+            if already_detected == "1":
+                has_human = True
+                logger.info("AI human detection skipped (already detected in this dialog)")
+            else:
+                # Download photo to memory for AI analysis
+                dest = io.BytesIO()
+                photo = message.photo[-1]
+                await message.bot.download(photo, destination=dest)
+                dest.seek(0)
                 
-                if already_detected == "1":
+                # Call AI Service (offline)
+                ai_service = AIService()
+                is_human = await ai_service.detect_human(dest.read())
+                if is_human:
                     has_human = True
-                    logger.info("AI human detection skipped (already detected in this dialog)")
+                    # Remember that this sender has sent a human photo in this dialog
+                    await redis.set(redis_key, "1", ex=3600) # 1 hour expiry
+                    # IMPORTANT: Set the global flag that this dialog REQUIRES appearance rating from PARTNER
+                    await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
+                    logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
+
+            # Prepare admin alert info
+            username = escape_markdown(message.from_user.username or "NoTag")
+            full_name = escape_markdown(message.from_user.full_name or "Unknown")
+            rating = float(me.season_rating_chat or 0.0)
+            
+            # Prepare partner info
+            res_p_full = await session.execute(select(User).where(User.telegram_id == partner_tg))
+            partner_user = res_p_full.scalar_one_or_none()
+            
+            partner_label = f"{partner_tg}"
+            if partner_user:
+                p_name = f" ({partner_user.city})" if partner_user.city else ""
+                p_tag = f" @{partner_user.username}" if partner_user.username else ""
+                p_full = f" {partner_user.full_name}" if partner_user.full_name else ""
+                partner_label = f"{p_full}{p_tag} [ID: {partner_tg}]{p_name}".strip()
+
+            # Improved caption for admin
+            caption = (
+                f"📸 From: {full_name} (@{username}) [ID: {message.from_user.id}] [Rating: {rating:.1f}] "
+                f"-> To: {partner_label} [Dialog: {dialog_id}]"
+            )
+            caption += f" [AI Human: {'✅' if has_human else '❌'}]"
+            
+            # Ensure the channel ID is correctly formatted for Telegram (-100 prefix)
+            # The user says it is stored with -100, but the error "chat not found" 
+            # often happens if the value is interpreted as a string or missing the prefix.
+            target_chat_id = settings.alerts_chat_id
+            chat_id_str = str(target_chat_id)
+            if not chat_id_str.startswith("-100"):
+                if chat_id_str.startswith("-"):
+                    target_chat_id = int("-100" + chat_id_str[1:])
                 else:
-                    # Download photo to memory for AI analysis
-                    dest = io.BytesIO()
-                    photo = message.photo[-1]
-                    await message.bot.download(photo, destination=dest)
-                    dest.seek(0)
-                    
-                    # Call AI Service
-                    ai_service = AIService(api_key=settings.hf_token)
-                    is_human = await ai_service.detect_human(dest.read())
-                    if is_human:
-                        has_human = True
-                        # Remember that this sender has sent a human photo in this dialog
-                        await redis.set(redis_key, "1", ex=3600) # 1 hour expiry
-                        # IMPORTANT: Set the global flag that this dialog REQUIRES appearance rating from PARTNER
-                        await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
-                        logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
+                    target_chat_id = int("-100" + chat_id_str)
+            
+            logger.info("forward_photo_to_admin attempt chat_id=%s", target_chat_id)
 
-                # Prepare admin alert info
-                username = escape_markdown(message.from_user.username or "NoTag")
-                full_name = escape_markdown(message.from_user.full_name or "Unknown")
-                rating = float(me.season_rating_chat or 0.0)
-                
-                # Prepare partner info
-                res_p_full = await session.execute(select(User).where(User.telegram_id == partner_tg))
-                partner_user = res_p_full.scalar_one_or_none()
-                
-                partner_label = f"{partner_tg}"
-                if partner_user:
-                    p_name = f" ({partner_user.city})" if partner_user.city else ""
-                    p_tag = f" @{partner_user.username}" if partner_user.username else ""
-                    p_full = f" {partner_user.full_name}" if partner_user.full_name else ""
-                    partner_label = f"{p_full}{p_tag} [ID: {partner_tg}]{p_name}".strip()
-
-                # Improved caption for admin
-                caption = (
-                    f"📸 From: {full_name} (@{username}) [ID: {message.from_user.id}] [Rating: {rating:.1f}] "
-                    f"-> To: {partner_label} [Dialog: {dialog_id}]"
-                )
-                if settings.hf_token:
-                    caption += f" [AI Human: {'✅' if has_human else '❌'}]"
-                
-                # Ensure the channel ID is correctly formatted for Telegram (-100 prefix)
-                # The user says it is stored with -100, but the error "chat not found" 
-                # often happens if the value is interpreted as a string or missing the prefix.
-                target_chat_id = settings.alerts_chat_id
-                chat_id_str = str(target_chat_id)
-                if not chat_id_str.startswith("-100"):
-                    if chat_id_str.startswith("-"):
-                        target_chat_id = int("-100" + chat_id_str[1:])
-                    else:
-                        target_chat_id = int("-100" + chat_id_str)
-                
-                logger.info("forward_photo_to_admin attempt chat_id=%s", target_chat_id)
-
-                await message.bot.send_photo(
-                    chat_id=target_chat_id,
-                    photo=message.photo[-1].file_id,
-                    caption=caption
-                )
-            except Exception:
-                logger.exception("failed_forward_photo_to_admin alerts_chat_id=%s", settings.alerts_chat_id)
+            await message.bot.send_photo(
+                chat_id=target_chat_id,
+                photo=message.photo[-1].file_id,
+                caption=caption
+            )
+        except Exception:
+            logger.exception("failed_forward_photo_to_admin alerts_chat_id=%s", settings.alerts_chat_id)
 
         # 3. Save reference to DB (without local storage if possible, but keeping DB record for tracking)
         await svc.save_photo(message.bot, session, dialog_id, me.id, message.from_user.id, message)

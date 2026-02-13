@@ -5,64 +5,68 @@ import io
 import asyncio
 import numpy as np
 import cv2
-import mediapipe as mp
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 class AIService:
-    def __init__(self, api_key: str):
-        self._api_key = api_key
-        # MediaPipe for local backup
-        self._mp_face_detection = mp.solutions.face_detection
-        self._face_detection = self._mp_face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5
+    def __init__(self, api_key: str | None = None):
+        # Local, fast, and reliable face detection.
+        # Primary: OpenCV Haar cascade (always available offline).
+        # Optional: MediaPipe solutions API if present in the environment.
+        self._face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
 
     async def detect_human(self, photo_bytes: bytes) -> bool:
         """
-        Dual-mode human detection: 
-        1. Try Hugging Face Router (High quality)
-        2. Fallback to local MediaPipe (Always works)
+        Fast local human face detection.
+        Returns True if a face is detected.
         """
-        # Try HF Router first (using the NEW endpoint to avoid 410 error)
-        try:
-            import aiohttp
-            # Hugging Face says: Use router.huggingface.co instead of api-inference.huggingface.co
-            url = "https://router.huggingface.co/hf-inference/models/facebook/detr-resnet-50"
-            headers = {"Authorization": f"Bearer {self._api_key}"}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, data=photo_bytes, timeout=5) as response:
-                    if response.status == 200:
-                        results = await response.json()
-                        for item in results:
-                            if item.get('label') == 'person' and item.get('score', 0) > 0.5:
-                                logger.info("Human detected via HF Router!")
-                                return True
-                    else:
-                        logger.warning("HF Router failed (status %s), falling back to MediaPipe", response.status)
-        except Exception as e:
-            logger.warning("HF Router error: %s, falling back to MediaPipe", e)
-
-        # Fallback to Local MediaPipe
         try:
             def sync_detect():
+                # Convert bytes to numpy array
                 nparr = np.frombuffer(photo_bytes, np.uint8)
                 image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if image is None: return False
-                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                results = self._face_detection.process(rgb_image)
-                return bool(results.detections)
+                
+                if image is None:
+                    logger.error("Failed to decode image")
+                    return False
+
+                # 1) OpenCV Haar cascade (very fast)
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                faces = self._face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(30, 30),
+                )
+                if len(faces) > 0:
+                    return True
+
+                # 2) Optional MediaPipe fallback if solutions API exists
+                try:
+                    import mediapipe as mp
+
+                    if not hasattr(mp, "solutions"):
+                        return False
+
+                    mp_face_detection = mp.solutions.face_detection
+                    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    with mp_face_detection.FaceDetection(
+                        model_selection=1,
+                        min_detection_confidence=0.6,
+                    ) as detector:
+                        results = detector.process(rgb_image)
+                        return bool(results.detections)
+                except Exception:
+                    return False
 
             loop = asyncio.get_event_loop()
-            is_human = await loop.run_in_executor(None, sync_detect)
-            if is_human:
-                logger.info("Human detected via local MediaPipe fallback!")
-            return is_human
+            return await loop.run_in_executor(None, sync_detect)
+            
         except Exception:
-            logger.exception("local_fallback_failed")
+            logger.exception("local_cv_detection_failed")
             return False
 
     async def contains_human(self, photo_bytes: bytes) -> bool:
