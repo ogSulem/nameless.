@@ -31,7 +31,7 @@ class AIService:
         self._mp_face_detector_error: str | None = None
         self._mp_lock = threading.Lock()
 
-        self._vision_max_side = 512
+        self._vision_max_side = 640
 
     def _resize_max_side(self, bgr: np.ndarray) -> np.ndarray:
         max_side = int(self._vision_max_side or 0)
@@ -156,19 +156,20 @@ class AIService:
                                 except Exception:
                                     pass
 
-                        if score_ok:
-                            return (
-                                True,
-                                {
-                                    "backend": "mediapipe_face_detection",
-                                    "faces": int(cnt),
-                                    "min_conf": 0.7,
-                                    "model_selection": 0,
-                                    "w": int(w),
-                                    "h": int(h),
-                                    "error": None,
-                                },
-                            )
+                        # IMPORTANT: If MediaPipe is available and ran, we trust its verdict.
+                        # Do NOT fall back to Haar on "no detections"; that would change behavior and increase FP/FN.
+                        return (
+                            bool(score_ok),
+                            {
+                                "backend": "mediapipe_face_detection",
+                                "faces": int(cnt),
+                                "min_conf": 0.7,
+                                "model_selection": 0,
+                                "w": int(w),
+                                "h": int(h),
+                                "error": None,
+                            },
+                        )
                 except Exception as e:
                     # Ignore: environment may not have mediapipe or mp.solutions
                     insight_err = str(e)
