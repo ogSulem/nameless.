@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "name": "anonymous-chat-bot",
+  "services": {
+    "bot": {
+      "source": ".",
+      "healthcheck": {
+        "test": "python3 -c 'import sys; exit(0)'",
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 3,
+        "startPeriod": "10s"
+      },
+      "variables": {
+        "PYTHONUNBUFFERED": "1",
+        "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
+        "REDIS_URL": "${{Redis.REDIS_URL}}"
+      }
+    }
+  }
+}
