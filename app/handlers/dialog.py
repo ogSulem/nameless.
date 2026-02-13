@@ -27,6 +27,9 @@ from app.utils.markdown import escape_markdown
 logger = logging.getLogger(__name__)
 router = Router(name="dialog")
 
+_AI_SERVICE = AIService()
+_AI_DETECT_SEMAPHORE = asyncio.Semaphore(2)
+
 async def _get_dialog_id(redis: Redis, tg_id: int) -> int | None:
     v = await redis.get(keys.active_dialog(tg_id))
     return int(v) if v else None
@@ -266,13 +269,13 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                 dest.seek(0)
                 
                 # Call AI Service (offline)
-                ai_service = AIService()
                 photo_bytes = dest.read()
                 try:
-                    is_human, ai_meta = await asyncio.wait_for(
-                        ai_service.detect_human_with_meta(photo_bytes),
-                        timeout=4.0,
-                    )
+                    async with _AI_DETECT_SEMAPHORE:
+                        is_human, ai_meta = await asyncio.wait_for(
+                            _AI_SERVICE.detect_human_with_meta(photo_bytes),
+                            timeout=4.0,
+                        )
                 except asyncio.TimeoutError:
                     is_human = False
                     ai_meta = {"backend": "timeout", "error": "detect_timeout"}
@@ -280,9 +283,23 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                     has_human = True
                     # Remember that this sender has sent a human photo in this dialog
                     await redis.set(redis_key, "1", ex=3600) # 1 hour expiry
-                    # IMPORTANT: Set the global flag that this dialog REQUIRES appearance rating from PARTNER
-                    await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
-                    logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
+
+                    # IMPORTANT: Only set appearance flag if dialog is still active for both sides.
+                    # If the chat ended / user got rematched while detection was running, don't ask for appearance.
+                    cur_sender_dialog = await redis.get(keys.active_dialog(message.from_user.id))
+                    cur_partner_dialog = await redis.get(keys.active_dialog(partner_tg))
+                    if cur_sender_dialog and cur_partner_dialog and int(cur_sender_dialog) == int(dialog_id) and int(cur_partner_dialog) == int(dialog_id):
+                        await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
+                        logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
+                    else:
+                        logger.info(
+                            "AI human detected but dialog not active anymore; skip appearance flag sender=%s partner=%s dialog_id=%s cur_sender=%s cur_partner=%s",
+                            message.from_user.id,
+                            partner_tg,
+                            dialog_id,
+                            cur_sender_dialog,
+                            cur_partner_dialog,
+                        )
 
             if ai_meta is not None:
                 logger.info(

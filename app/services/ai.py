@@ -27,6 +27,10 @@ class AIService:
             cv2.data.haarcascades + "haarcascade_eye.xml"
         )
 
+        self._mp_face_detector: Any | None = None
+        self._mp_face_detector_error: str | None = None
+        self._mp_lock = threading.Lock()
+
     async def _get_insight_model(self) -> Any | None:
         """Lazy-init InsightFace model once per process. Returns None if unavailable."""
         if AIService._insight_model is not None:
@@ -122,11 +126,25 @@ class AIService:
                     if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
                         mp_face_detection = mp.solutions.face_detection
                         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        with mp_face_detection.FaceDetection(
-                            model_selection=1,
-                            min_detection_confidence=0.65,
-                        ) as detector:
-                            results = detector.process(rgb_image)
+
+                        with self._mp_lock:
+                            if self._mp_face_detector is None and self._mp_face_detector_error is None:
+                                try:
+                                    self._mp_face_detector = mp_face_detection.FaceDetection(
+                                        model_selection=0,
+                                        min_detection_confidence=0.7,
+                                    )
+                                except Exception as e:
+                                    self._mp_face_detector_error = str(e)
+
+                            detector = self._mp_face_detector
+
+                        if detector is not None:
+                            # MediaPipe graphs are not guaranteed to be thread-safe under concurrent calls.
+                            with self._mp_lock:
+                                results = detector.process(rgb_image)
+                        else:
+                            results = None
 
                         detections = getattr(results, "detections", None) if results is not None else None
                         score_ok = False
@@ -135,7 +153,7 @@ class AIService:
                             for det in detections:
                                 cnt += 1
                                 try:
-                                    if det.score and det.score[0] > 0.65:
+                                    if det.score and det.score[0] >= 0.7:
                                         score_ok = True
                                 except Exception:
                                     pass
@@ -146,6 +164,8 @@ class AIService:
                                 {
                                     "backend": "mediapipe_face_detection",
                                     "faces": int(cnt),
+                                    "min_conf": 0.7,
+                                    "model_selection": 0,
                                     "w": int(w),
                                     "h": int(h),
                                     "error": None,
