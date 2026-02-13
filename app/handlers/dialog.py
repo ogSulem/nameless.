@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -246,6 +247,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
 
         # AI Vision check: offline face detection (OpenCV)
         has_human = False
+        ai_meta: dict[str, Any] | None = None
         try:
             # Check if we already detected a human from this sender in this dialog to save CPU
             redis_key = f"dialog:{dialog_id}:sender:{message.from_user.id}:human_detected"
@@ -253,6 +255,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
             
             if already_detected == "1":
                 has_human = True
+                ai_meta = {"cached": True}
                 logger.info("AI human detection skipped (already detected in this dialog)")
             else:
                 # Download photo to memory for AI analysis
@@ -263,7 +266,7 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                 
                 # Call AI Service (offline)
                 ai_service = AIService()
-                is_human = await ai_service.detect_human(dest.read())
+                is_human, ai_meta = await ai_service.detect_human_with_meta(dest.read())
                 if is_human:
                     has_human = True
                     # Remember that this sender has sent a human photo in this dialog
@@ -294,6 +297,32 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                 f"-> To: {partner_label} [Dialog: {dialog_id}]"
             )
             caption += f" [AI Human: {'✅' if has_human else '❌'}]"
+
+            if ai_meta is not None:
+                backend = ai_meta.get("backend")
+                faces = ai_meta.get("faces")
+                eyes = ai_meta.get("eyes")
+                w = ai_meta.get("w")
+                h = ai_meta.get("h")
+                cached = ai_meta.get("cached")
+                err = ai_meta.get("error")
+
+                details = []
+                if backend is not None:
+                    details.append(f"backend={backend}")
+                if w is not None and h is not None:
+                    details.append(f"size={w}x{h}")
+                if faces is not None:
+                    details.append(f"faces={faces}")
+                if eyes is not None:
+                    details.append(f"eyes={eyes}")
+                if cached:
+                    details.append("cached=1")
+                if err:
+                    details.append(f"err={err}")
+
+                if details:
+                    caption += " [AI " + ", ".join(details) + "]"
             
             # Ensure the channel ID is correctly formatted for Telegram (-100 prefix)
             # The user says it is stored with -100, but the error "chat not found" 
