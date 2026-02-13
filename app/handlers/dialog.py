@@ -275,6 +275,23 @@ async def relay_messages(message: Message, session: AsyncSession, redis: Redis, 
                     await redis.set(f"appearance_rating_required:{partner_tg}:{dialog_id}", "1", ex=3600)
                     logger.info("AI human detected! Flag set for partner_tg=%s", partner_tg)
 
+            if ai_meta is not None:
+                logger.info(
+                    "ai_face_verdict dialog_id=%s from_tg=%s to_tg=%s verdict=%s backend=%s faces=%s eyes=%s size=%sx%s cached=%s err=%s insight_err=%s",
+                    dialog_id,
+                    message.from_user.id,
+                    partner_tg,
+                    1 if has_human else 0,
+                    ai_meta.get("backend"),
+                    ai_meta.get("faces"),
+                    ai_meta.get("eyes"),
+                    ai_meta.get("w"),
+                    ai_meta.get("h"),
+                    1 if ai_meta.get("cached") else 0,
+                    ai_meta.get("error"),
+                    ai_meta.get("insight_error") or ai_meta.get("insight_init_error"),
+                )
+
             # Prepare admin alert info
             username = escape_markdown(message.from_user.username or "NoTag")
             full_name = escape_markdown(message.from_user.full_name or "Unknown")
