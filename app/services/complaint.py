@@ -26,16 +26,22 @@ class ComplaintService:
         from_tg_id: int,
         reason: str,
     ) -> None:
+        # Actually, let's keep it simple and just optimize the queries here since create_and_notify 
+        # is already called with a session.
         res = await session.execute(select(User.id).where(User.telegram_id == from_tg_id))
         from_user_id = res.scalar_one_or_none()
         if from_user_id is None:
             return
 
-        res_d = await session.execute(select(Dialog).where(Dialog.id == dialog_id))
-        dialog = res_d.scalar_one_or_none()
+        res_d = await session.execute(
+            select(Dialog.user1_id, Dialog.user2_id)
+            .where(Dialog.id == dialog_id)
+        )
+        dialog_row = res_d.one_or_none()
         accused_tg_id: int | None = None
-        if dialog is not None:
-            accused_user_id = dialog.user2_id if dialog.user1_id == from_user_id else dialog.user1_id
+        if dialog_row is not None:
+            u1_id, u2_id = dialog_row
+            accused_user_id = u2_id if u1_id == from_user_id else u1_id
             res_acc = await session.execute(select(User.telegram_id).where(User.id == accused_user_id))
             accused_tg_id = res_acc.scalar_one_or_none()
             accused_tg_id = int(accused_tg_id) if accused_tg_id else None
@@ -93,6 +99,11 @@ class ComplaintService:
                 
                 # 2. Send photos if any
                 for p in photos:
+                    tg_file_id = self._extract_tg_file_id(p)
+                    if tg_file_id:
+                        await safe_send_photo(bot, admin_id, photo=tg_file_id)
+                        continue
+
                     abs_path = self._resolve_media_path(media_root=media_root, stored_path=p)
                     if abs_path and os.path.exists(abs_path):
                         await safe_send_photo(bot, admin_id, photo=FSInputFile(abs_path))
@@ -112,3 +123,14 @@ class ComplaintService:
             return os.path.join(media_root, rel)
 
         return os.path.join(media_root, p.lstrip("/"))
+
+    def _extract_tg_file_id(self, stored_path: str) -> str | None:
+        if not stored_path:
+            return None
+
+        p = stored_path.strip()
+        if not p.startswith("tg://"):
+            return None
+
+        file_id = p.removeprefix("tg://").strip()
+        return file_id or None

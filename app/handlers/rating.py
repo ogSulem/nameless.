@@ -26,6 +26,7 @@ from app.services.matchmaking import MatchmakingService
 from app.services.rating import RatingService
 from app.ui import send_new_ui, edit_ui, get_ui_message_id
 from app.telegram_safe import safe_delete_message, safe_send_message, safe_edit_message_text
+from app.utils.ratelimit import rate_limit
 
 logger = logging.getLogger(__name__)
 router = Router(name="rating")
@@ -45,6 +46,27 @@ def _b2s(v: str | bytes | None) -> str | None:
 
 def _rating_message_key(tg_id: int) -> str:
     return keys.ui_rating_message_id(tg_id)
+
+
+async def _user_id_by_tg_cached(redis: Redis, session: AsyncSession, tg_id: int) -> int | None:
+    key = keys.user_id_by_tg(int(tg_id))
+    try:
+        v = await redis.get(key)
+        if v:
+            return int(v)
+    except Exception:
+        pass
+
+    res = await session.execute(select(User.id).where(User.telegram_id == int(tg_id)))
+    uid = res.scalar_one_or_none()
+    if uid is None:
+        return None
+
+    try:
+        await redis.set(key, str(int(uid)), ex=300)
+    except Exception:
+        pass
+    return int(uid)
 
 
 async def _get_rating_message_id(redis: Redis, tg_id: int) -> int | None:
@@ -71,17 +93,31 @@ async def _edit_rating_message(bot, redis: Redis, tg_id: int, text: str, reply_m
 
 
 async def _clear_pending(redis: Redis, tg_id: int) -> None:
-    await redis.delete(keys.pending_rating(tg_id))
-    await redis.delete(keys.pending_rating_has_photos(tg_id))
-    await redis.delete(keys.pending_rating_partner(tg_id))
-    await redis.delete(keys.pending_rating_action(tg_id))
-    await redis.delete(keys.pending_rating_step(tg_id))
-    await redis.delete(_rating_message_key(tg_id))
+    pipe = redis.pipeline(transaction=False)
+    pipe.delete(keys.pending_rating(tg_id))
+    pipe.delete(keys.pending_rating_has_photos(tg_id))
+    pipe.delete(keys.pending_rating_partner(tg_id))
+    pipe.delete(keys.pending_rating_action(tg_id))
+    pipe.delete(keys.pending_rating_step(tg_id))
+    pipe.delete(_rating_message_key(tg_id))
+    try:
+        await pipe.execute()
+    except Exception:
+        # Best-effort cleanup
+        pass
 
 
 async def _pending_dialog(redis: Redis, tg_id: int) -> tuple[int | None, bool]:
-    d = _b2s(await redis.get(keys.pending_rating(tg_id)))
-    hp = _b2s(await redis.get(keys.pending_rating_has_photos(tg_id)))
+    pipe = redis.pipeline(transaction=False)
+    pipe.get(keys.pending_rating(tg_id))
+    pipe.get(keys.pending_rating_has_photos(tg_id))
+    try:
+        d_raw, hp_raw = await pipe.execute()
+    except Exception:
+        d_raw, hp_raw = None, None
+
+    d = _b2s(d_raw)
+    hp = _b2s(hp_raw)
     return (int(d) if d else None, hp == "1")
 
 
@@ -112,8 +148,17 @@ def _gender_short(v: str) -> str:
 
 
 async def _continue_after_rating_tg(bot, tg_id: int, session: AsyncSession, redis: Redis) -> None:
-    action = await _pending_action(redis, tg_id)
-    mid = await _get_rating_message_id(redis, tg_id)
+    pipe = redis.pipeline(transaction=False)
+    pipe.get(keys.pending_rating_action(tg_id))
+    pipe.get(_rating_message_key(tg_id))
+    try:
+        action_raw, mid_raw = await pipe.execute()
+    except Exception:
+        action_raw, mid_raw = None, None
+
+    action = _b2s(action_raw) or "end"
+    mid = int(mid_raw) if mid_raw else None
+
     await _clear_pending(redis, tg_id)
 
     logger.info("continue_rating tg=%s action=%s mid=%s", tg_id, action, mid)
@@ -256,23 +301,39 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
             pass
         return
 
-    res = await session.execute(select(User.id).where(User.telegram_id == message.from_user.id))
-    from_user_id = res.scalar_one_or_none()
+    from_user_id = await _user_id_by_tg_cached(redis, session, message.from_user.id)
     if from_user_id is None:
         return
 
-    to_tg = await redis.get(keys.pending_rating_partner(message.from_user.id))
+    to_tg_raw = None
+    try:
+        to_tg_raw = await redis.get(keys.pending_rating_partner(message.from_user.id))
+    except Exception:
+        to_tg_raw = None
+
     to_user_id = None
+    to_tg = int(to_tg_raw) if to_tg_raw else None
     if to_tg:
-        res2 = await session.execute(select(User.id).where(User.telegram_id == int(to_tg)))
-        to_user_id = res2.scalar_one_or_none()
+        to_user_id = await _user_id_by_tg_cached(redis, session, to_tg)
     if to_user_id is None:
         await send_new_ui(message.bot, redis, message.from_user.id, "Не удалось определить собеседника")
         return
 
-    to_user = await session.get(User, to_user_id)
-    if to_user is None:
+    res_to = await session.execute(
+        select(
+            User.telegram_id,
+            User.gender,
+            User.birth_date,
+            User.city,
+            User.season_rating_chat,
+            User.season_rating_appearance,
+        ).where(User.id == to_user_id)
+    )
+    to_row = res_to.one_or_none()
+    if to_row is None:
         return
+
+    to_tg_id, to_gender, to_birth_date, to_city, to_season_chat, to_season_app = to_row
 
     logger.info(
         "rating_input dialog_id=%s from_tg=%s step=%s value=%s has_photos=%s",
@@ -312,16 +373,16 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
     recalculated, new_chat, new_app, prev_chat = await RatingService().on_rating_saved(session=session, to_user_id=to_user_id)
 
     try:
-        await session.refresh(to_user)
+        await redis.delete(keys.profile_text(int(to_tg_id)))
     except Exception:
         pass
 
     logger.info(
         "rating_recalculated_applied dialog_id=%s to_tg=%s avg_chat=%s avg_app=%s seasonal_valid=%s",
         dialog_id,
-        to_user.telegram_id,
-        float(to_user.season_rating_chat or 0.0),
-        float(to_user.season_rating_appearance or 0.0),
+        int(to_tg_id),
+        float(to_season_chat or 0.0),
+        float(to_season_app or 0.0),
         bool(r.is_seasonal_valid),
     )
 
@@ -334,10 +395,10 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
                     "\n".join(
                         [
                             "⚠️ Резкое изменение среднего рейтинга",
-                            f"User: {to_user.telegram_id} (tg://user?id={to_user.telegram_id})",
-                            f"Пол: {_gender_short(to_user.gender.value)}",
-                            f"Возраст: {_age(to_user.birth_date)}",
-                            f"Город: {to_user.city or '-'}",
+                            f"User: {int(to_tg_id)} (tg://user?id={int(to_tg_id)})",
+                            f"Пол: {_gender_short(to_gender.value)}",
+                            f"Возраст: {_age(to_birth_date)}",
+                            f"Город: {to_city or '-'}",
                             f"Prev avg chat: {prev_chat:.2f}",
                             f"New avg chat: {new_chat:.2f}",
                             f"Incoming rating: {value}",
@@ -350,9 +411,11 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
             except Exception:
                 logger.exception("failed_notify_admin_drop admin=%s", admin_id)
 
-    hp = _b2s(await redis.get(keys.pending_rating_has_photos(message.from_user.id)))
-    if step == "chat" and hp == "1":
-        await redis.set(keys.pending_rating_step(message.from_user.id), "appearance", ex=60 * 60)
+    if step == "chat" and has_photos:
+        try:
+            await redis.set(keys.pending_rating_step(message.from_user.id), "appearance", ex=60 * 60)
+        except Exception:
+            pass
         await _edit_rating_message(message.bot, redis, message.from_user.id, "Введи рейтинг по внешности от 0 до 10:")
         logger.info("rated_chat dialog_id=%s from=%s", dialog_id, message.from_user.id)
         return
@@ -363,6 +426,14 @@ async def rating_text_input(message: Message, session: AsyncSession, redis: Redi
 
 @router.callback_query(F.data == "complaint")
 async def complaint_start(call: CallbackQuery, state: FSMContext, redis: Redis) -> None:
+    if call.from_user is None:
+        await call.answer()
+        return
+
+    ok = await rate_limit(redis, key=f"rl:user:complaint_start:{call.from_user.id}", ttl_s=2)
+    if not ok:
+        await call.answer()
+        return
     await state.set_state(ComplaintStates.waiting_reason)
     await _edit_rating_message(
         call.bot,
@@ -376,6 +447,14 @@ async def complaint_start(call: CallbackQuery, state: FSMContext, redis: Redis) 
 
 @router.callback_query(F.data == "complaint_cancel")
 async def complaint_cancel(call: CallbackQuery, state: FSMContext, session: AsyncSession, redis: Redis) -> None:
+    if call.from_user is None:
+        await call.answer()
+        return
+
+    ok = await rate_limit(redis, key=f"rl:user:complaint_cancel:{call.from_user.id}", ttl_s=2)
+    if not ok:
+        await call.answer()
+        return
     current_state = await state.get_state()
     if current_state != ComplaintStates.waiting_reason.state:
         await call.answer()

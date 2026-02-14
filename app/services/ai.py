@@ -33,13 +33,51 @@ class AIService:
         self._mp_lock = threading.Lock()
 
         self._vision_max_side = 640
-        self._vision_min_conf = 0.7
+        self._vision_min_conf = 0.65
+        self._vision_mp_model_selection = 0
+        self._vision_mp_min_face_px = 24
+        self._vision_haar_veto_enabled = True
+        self._vision_haar_veto_conf_margin = 0.1
+        self._vision_haar_veto_max_face_px = 40
 
     def configure_from_settings(self, settings: Any) -> None:
         try:
             v = float(getattr(settings, "vision_min_conf", 0.7) or 0.7)
             if 0.0 < v < 1.0:
                 self._vision_min_conf = v
+        except Exception:
+            pass
+
+        try:
+            ms = int(getattr(settings, "vision_mp_model_selection", 0) or 0)
+            if ms in (0, 1):
+                self._vision_mp_model_selection = ms
+        except Exception:
+            pass
+
+        try:
+            mpx = int(getattr(settings, "vision_mp_min_face_px", 24) or 24)
+            if mpx >= 0:
+                self._vision_mp_min_face_px = mpx
+        except Exception:
+            pass
+
+        try:
+            self._vision_haar_veto_enabled = bool(getattr(settings, "vision_haar_veto_enabled", True))
+        except Exception:
+            pass
+
+        try:
+            m = float(getattr(settings, "vision_haar_veto_conf_margin", 0.1) or 0.1)
+            if 0.0 <= m <= 1.0:
+                self._vision_haar_veto_conf_margin = m
+        except Exception:
+            pass
+
+        try:
+            mx = int(getattr(settings, "vision_haar_veto_max_face_px", 40) or 40)
+            if mx >= 0:
+                self._vision_haar_veto_max_face_px = mx
         except Exception:
             pass
 
@@ -147,7 +185,7 @@ class AIService:
                             if self._mp_face_detector is None and self._mp_face_detector_error is None:
                                 try:
                                     self._mp_face_detector = mp_face_detection.FaceDetection(
-                                        model_selection=0,
+                                        model_selection=int(self._vision_mp_model_selection),
                                         min_detection_confidence=float(self._vision_min_conf),
                                     )
                                 except Exception as e:
@@ -163,26 +201,106 @@ class AIService:
                             results = None
 
                         detections = getattr(results, "detections", None) if results is not None else None
-                        score_ok = False
-                        cnt = 0
+                        mp_cnt = 0
+                        mp_faces_kept = 0
+                        mp_max_conf = 0.0
+                        mp_max_bbox: list[int] | None = None
+                        det_h, det_w = image_det.shape[:2]
+                        min_face_px = int(self._vision_mp_min_face_px or 0)
+
                         if detections:
                             for det in detections:
-                                cnt += 1
+                                mp_cnt += 1
                                 try:
-                                    if det.score and det.score[0] >= float(self._vision_min_conf):
-                                        score_ok = True
+                                    conf = float(det.score[0]) if det.score else 0.0
                                 except Exception:
-                                    pass
+                                    conf = 0.0
 
-                        # IMPORTANT: If MediaPipe is available and ran, we trust its verdict.
-                        # Do NOT fall back to Haar on "no detections"; that would change behavior and increase FP/FN.
+                                bbox_px: list[int] | None = None
+                                try:
+                                    rb = det.location_data.relative_bounding_box
+                                    x = int(round(float(rb.xmin) * det_w))
+                                    y = int(round(float(rb.ymin) * det_h))
+                                    bw = int(round(float(rb.width) * det_w))
+                                    bh = int(round(float(rb.height) * det_h))
+                                    bbox_px = [x, y, bw, bh]
+                                except Exception:
+                                    bbox_px = None
+
+                                if bbox_px is not None and min_face_px > 0:
+                                    if min(int(bbox_px[2]), int(bbox_px[3])) < min_face_px:
+                                        continue
+
+                                mp_faces_kept += 1
+                                if conf >= mp_max_conf:
+                                    mp_max_conf = conf
+                                    mp_max_bbox = bbox_px
+
+                        mp_has_human = bool(mp_faces_kept > 0 and mp_max_conf >= float(self._vision_min_conf))
+
+                        veto_checked = False
+                        veto_passed = True
+                        haar_meta: dict[str, Any] | None = None
+
+                        if mp_has_human and bool(self._vision_haar_veto_enabled):
+                            bbox_min_side = 0
+                            if mp_max_bbox is not None:
+                                bbox_min_side = int(min(int(mp_max_bbox[2]), int(mp_max_bbox[3])))
+
+                            # Conservative veto: only challenge very small detections.
+                            # This targets typical "texture" false positives while keeping recall high.
+                            suspicious = bool(bbox_min_side > 0 and bbox_min_side <= int(self._vision_haar_veto_max_face_px))
+
+                            if suspicious:
+                                veto_checked = True
+                                gray = cv2.cvtColor(image_det, cv2.COLOR_BGR2GRAY)
+                                md = min(det_w, det_h)
+                                min_size = max(30, int(md * 0.12))
+                                faces = self._face_cascade.detectMultiScale(
+                                    gray,
+                                    scaleFactor=1.2,
+                                    minNeighbors=8,
+                                    minSize=(min_size, min_size),
+                                )
+                                eyes_total = 0
+                                accepted = False
+                                for (x, y, fw, fh) in faces:
+                                    y2 = y + max(1, int(fh * 0.6))
+                                    roi = gray[y:y2, x : x + fw]
+                                    if roi.size == 0:
+                                        continue
+                                    eyes = self._eye_cascade.detectMultiScale(
+                                        roi,
+                                        scaleFactor=1.1,
+                                        minNeighbors=6,
+                                        minSize=(max(15, int(fw * 0.15)), max(15, int(fh * 0.15))),
+                                    )
+                                    eyes_total += int(len(eyes))
+                                    if len(eyes) >= 1 or (fw >= int(md * 0.22) and fh >= int(md * 0.22)):
+                                        accepted = True
+
+                                veto_passed = bool(accepted)
+                                haar_meta = {
+                                    "backend": "opencv_haar_veto",
+                                    "faces": int(len(faces)),
+                                    "eyes": int(eyes_total),
+                                }
+
+                        final_has_human = bool(mp_has_human and (not veto_checked or veto_passed))
                         return (
-                            bool(score_ok),
+                            final_has_human,
                             {
                                 "backend": "mediapipe_face_detection",
-                                "faces": int(cnt),
+                                "faces": int(mp_faces_kept),
+                                "faces_raw": int(mp_cnt),
                                 "min_conf": float(self._vision_min_conf),
-                                "model_selection": 0,
+                                "model_selection": int(self._vision_mp_model_selection),
+                                "min_face_px": int(self._vision_mp_min_face_px),
+                                "max_conf": float(mp_max_conf),
+                                "max_bbox": mp_max_bbox,
+                                "haar_veto_checked": bool(veto_checked),
+                                "haar_veto_passed": bool(veto_passed),
+                                "haar": haar_meta,
                                 "w": int(w),
                                 "h": int(h),
                                 "error": None,

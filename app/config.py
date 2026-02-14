@@ -30,8 +30,15 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     media_root: str = Field(default="/app/media", alias="MEDIA_ROOT")
 
-    vision_min_conf: float = Field(default=0.7, alias="VISION_MIN_CONF")
+    port: int = Field(default=8080, alias="PORT")
+
+    vision_min_conf: float = Field(default=0.65, alias="VISION_MIN_CONF")
     vision_max_side: int = Field(default=640, alias="VISION_MAX_SIDE")
+    vision_mp_model_selection: int = Field(default=0, alias="VISION_MP_MODEL_SELECTION")
+    vision_mp_min_face_px: int = Field(default=24, alias="VISION_MP_MIN_FACE_PX")
+    vision_haar_veto_enabled: bool = Field(default=True, alias="VISION_HAAR_VETO_ENABLED")
+    vision_haar_veto_conf_margin: float = Field(default=0.1, alias="VISION_HAAR_VETO_CONF_MARGIN")
+    vision_haar_veto_max_face_px: int = Field(default=40, alias="VISION_HAAR_VETO_MAX_FACE_PX")
     vision_timeout_s: float = Field(default=4.0, alias="VISION_TIMEOUT_S")
     vision_concurrency: int = Field(default=2, alias="VISION_CONCURRENCY")
 
@@ -54,12 +61,17 @@ class Settings(BaseSettings):
                 db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
             elif db_url.startswith("postgresql://"):
                 db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-            return db_url
+            # Ensure no trailing slashes or spaces that might break asyncpg
+            return db_url.strip()
 
         # Priority 2: Build from individual components
+        if not self.db_host or not self.db_user or not self.db_password or not self.db_name:
+            # Fallback for local development if not all vars are set
+            return "postgresql+asyncpg://nameless:nameless@localhost:5432/nameless"
+
         return (
             f"postgresql+asyncpg://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+            f"@{self.db_host}:{self.db_port or 5432}/{self.db_name}"
         )
 
     @property

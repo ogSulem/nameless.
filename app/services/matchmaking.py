@@ -27,13 +27,29 @@ class MatchmakingService:
         self._redis = redis
 
     async def is_user_premium(self, session: AsyncSession, user_id: int) -> bool:
+        """Check if user has an active premium subscription. Cached in Redis."""
+        key = f"user:premium:{user_id}"
+        try:
+            v = await self._redis.get(key)
+            if v is not None:
+                return v == "1"
+        except Exception:
+            pass
+
         try:
             res = await session.execute(select(User.subscription_until).where(User.id == user_id))
             until = res.scalar_one_or_none()
             if until is None:
-                return False
-            u = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
-            return u > datetime.now(tz=timezone.utc)
+                is_prem = False
+            else:
+                u = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
+                is_prem = u > datetime.now(tz=timezone.utc)
+            
+            try:
+                await self._redis.set(key, "1" if is_prem else "0", ex=300)
+            except Exception:
+                pass
+            return is_prem
         except Exception:
             logger.exception("failed_check_premium user_id=%s", user_id)
             return False
@@ -41,23 +57,29 @@ class MatchmakingService:
     async def enqueue(self, telegram_user_id: int, city: str | None, is_premium_queue: bool) -> str:
         uid = str(telegram_user_id)
         q = self._select_queue(city=city, premium=is_premium_queue)
-        await self._redis.lrem(q, 0, uid)
-        await self._redis.lpush(q, uid)
+
+        pipe = self._redis.pipeline(transaction=False)
+        pipe.lrem(q, 0, uid)
+        pipe.lpush(q, uid)
 
         if city is not None:
             qg = self._select_queue(city=None, premium=is_premium_queue)
-            await self._redis.lrem(qg, 0, uid)
-            await self._redis.lpush(qg, uid)
+            pipe.lrem(qg, 0, uid)
+            pipe.lpush(qg, uid)
+
+        await pipe.execute()
         return q
 
     async def dequeue_from_all(self, telegram_user_id: int, city: str | None) -> None:
         uid = str(telegram_user_id)
+        pipe = self._redis.pipeline(transaction=False)
         for q in {
             keys.queue_global(),
             keys.queue_premium_global(),
-            *( {keys.queue_city(city), keys.queue_premium_city(city)} if city else set() ),
+            *({keys.queue_city(city), keys.queue_premium_city(city)} if city else set()),
         }:
-            await self._redis.lrem(q, 0, uid)
+            pipe.lrem(q, 0, uid)
+        await pipe.execute()
 
     async def try_match(
         self,
@@ -66,6 +88,16 @@ class MatchmakingService:
         premium: bool,
     ) -> MatchResult | None:
         partner_lock_key: str | None = None
+
+        last_partner_tg: int | None = None
+        try:
+            v = await self._redis.get(keys.last_partner(int(user.telegram_id)))
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", errors="ignore")
+            if v:
+                last_partner_tg = int(v)
+        except Exception:
+            last_partner_tg = None
 
         lock_key = keys.lock_match(user.telegram_id)
         lock_ttl_ms = 4000
@@ -118,21 +150,38 @@ class MatchmakingService:
 
                     partner_lock_key = keys.lock_match(candidate_tg_id)
 
-                    res = await session.execute(select(User).where(User.telegram_id == candidate_tg_id))
-                    candidate = res.scalar_one_or_none()
-                    
-                    if candidate is None or candidate.is_banned:
-                        await self._redis.delete(partner_lock_key)
-                        partner_lock_key = None
-                        continue
-
-                    if await session.get(ActiveDialog, candidate.id) is not None:
+                    # Avoid immediate rematch with the same partner (e.g. after skip).
+                    if last_partner_tg is not None and int(candidate_tg_id) == int(last_partner_tg):
                         await self._redis.lpush(source_queue, str(candidate_tg_id))
                         await self._redis.delete(partner_lock_key)
                         partner_lock_key = None
                         continue
 
-                    if await self._redis.get(keys.active_dialog(candidate.telegram_id)):
+                    # Optimize: Use a faster select for basic candidate info
+                    res = await session.execute(
+                        select(
+                            User.id, 
+                            User.telegram_id, 
+                            User.is_banned, 
+                            User.season_rating_chat
+                        ).where(User.telegram_id == candidate_tg_id)
+                    )
+                    cand_row = res.one_or_none()
+                    
+                    if cand_row is None or cand_row.is_banned:
+                        await self._redis.delete(partner_lock_key)
+                        partner_lock_key = None
+                        continue
+
+                    cand_id, cand_tg, cand_banned, cand_rating_raw = cand_row
+
+                    if await session.get(ActiveDialog, cand_id) is not None:
+                        await self._redis.lpush(source_queue, str(candidate_tg_id))
+                        await self._redis.delete(partner_lock_key)
+                        partner_lock_key = None
+                        continue
+
+                    if await self._redis.get(keys.active_dialog(cand_tg)):
                         await self._redis.lpush(source_queue, str(candidate_tg_id))
                         await self._redis.delete(partner_lock_key)
                         partner_lock_key = None
@@ -140,13 +189,16 @@ class MatchmakingService:
 
                     if premium:
                         # Premium users always get the best candidate among checked ones
-                        if candidate.season_rating_chat > best_rating:
-                            if best_candidate:
+                        cand_rating = float(cand_rating_raw or 0.0)
+                        if cand_rating > best_rating:
+                            if best_candidate_id:
                                 # Put previous "best" back into queue
-                                await self._redis.lpush(source_queue, str(best_candidate.telegram_id))
-                                await self._redis.delete(keys.lock_match(best_candidate.telegram_id))
-                            best_candidate = candidate
-                            best_rating = candidate.season_rating_chat
+                                await self._redis.lpush(source_queue, str(best_candidate_tg))
+                                await self._redis.delete(keys.lock_match(best_candidate_tg))
+                            
+                            best_candidate_id = cand_id
+                            best_candidate_tg = cand_tg
+                            best_rating = cand_rating
                         else:
                             # Put back into queue
                             await self._redis.lpush(source_queue, str(candidate_tg_id))
@@ -154,31 +206,39 @@ class MatchmakingService:
                             partner_lock_key = None
                     else:
                         # Non-premium matches with anyone immediately
-                        return candidate
+                        return MatchResult(dialog_id=0, partner_user_id=cand_tg, _temp_partner_id=cand_id)
 
-                return best_candidate
+                if best_candidate_id:
+                    return MatchResult(dialog_id=0, partner_user_id=best_candidate_tg, _temp_partner_id=best_candidate_id)
+                return None
 
-            partner = None
-
+            # Need to store IDs for the actual match creation outside _attempt_match
+            best_candidate_id: int | None = None
+            best_candidate_tg: int | None = None
+            
+            partner_info: MatchResult | None = None
             if user.city and city_queues:
-                partner = await _attempt_match(city_queues)
+                partner_info = await _attempt_match(city_queues)
 
-            if partner is None and global_queues:
-                partner = await _attempt_match(global_queues)
+            if partner_info is None and global_queues:
+                partner_info = await _attempt_match(global_queues)
 
-            if partner is None:
+            if partner_info is None:
                 await self.enqueue(user.telegram_id, user.city, is_premium_queue=premium)
                 logger.info("search_enqueued tg_id=%s premium=%s city=%s", user.telegram_id, premium, user.city)
                 return None
 
-            dialog = Dialog(user1_id=user.id, user2_id=partner.id, status=DialogStatus.active)
+            partner_tg = partner_info.partner_user_id
+            partner_db_id = getattr(partner_info, "_temp_partner_id", None)
+
+            dialog = Dialog(user1_id=user.id, user2_id=partner_db_id, status=DialogStatus.active)
             session.add(dialog)
             await session.flush()
 
             session.add_all(
                 [
                     ActiveDialog(user_id=user.id, dialog_id=dialog.id),
-                    ActiveDialog(user_id=partner.id, dialog_id=dialog.id),
+                    ActiveDialog(user_id=partner_db_id, dialog_id=dialog.id),
                 ]
             )
 
@@ -189,20 +249,26 @@ class MatchmakingService:
                 return None
 
             try:
-                await self._redis.set(keys.active_dialog(user.telegram_id), str(dialog.id), ex=60 * 60 * 12)
-                await self._redis.set(keys.active_dialog(partner.telegram_id), str(dialog.id), ex=60 * 60 * 12)
+                pipe = self._redis.pipeline(transaction=False)
+                pipe.set(keys.active_dialog(int(user.telegram_id)), str(dialog.id), ex=60 * 60 * 12)
+                pipe.set(keys.active_dialog(int(partner.telegram_id)), str(dialog.id), ex=60 * 60 * 12)
+
+                ttl = 60 * 60 * 12
+                pipe.set(keys.dialog_partner_tg(dialog.id, int(user.telegram_id)), str(int(partner.telegram_id)), ex=ttl)
+                pipe.set(keys.dialog_partner_tg(dialog.id, int(partner.telegram_id)), str(int(user.telegram_id)), ex=ttl)
 
                 # Reset rating/appearance-related state for a fresh dialog.
                 # This prevents leaking pending steps/flags between different partners.
-                for tg in (user.telegram_id, partner.telegram_id):
-                    await self._redis.delete(keys.pending_rating(tg))
-                    await self._redis.delete(keys.pending_rating_has_photos(tg))
-                    await self._redis.delete(keys.pending_rating_partner(tg))
-                    await self._redis.delete(keys.pending_rating_action(tg))
-                    await self._redis.delete(keys.pending_rating_step(tg))
+                for tg in (int(user.telegram_id), int(partner.telegram_id)):
+                    pipe.delete(keys.pending_rating(tg))
+                    pipe.delete(keys.pending_rating_has_photos(tg))
+                    pipe.delete(keys.pending_rating_partner(tg))
+                    pipe.delete(keys.pending_rating_action(tg))
+                    pipe.delete(keys.pending_rating_step(tg))
 
-                await self._redis.delete(keys.appearance_rating_required(user.telegram_id, dialog.id))
-                await self._redis.delete(keys.appearance_rating_required(partner.telegram_id, dialog.id))
+                pipe.delete(keys.appearance_rating_required(int(user.telegram_id), dialog.id))
+                pipe.delete(keys.appearance_rating_required(int(partner.telegram_id), dialog.id))
+                await pipe.execute()
             except Exception:
                 logger.exception("failed_set_active_dialog_cache user_tg=%s partner_tg=%s", user.telegram_id, partner.telegram_id)
 

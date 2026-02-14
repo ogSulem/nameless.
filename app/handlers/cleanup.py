@@ -17,6 +17,9 @@ router = Router(name="cleanup")
 
 @router.callback_query()
 async def cleanup_callbacks_during_search(call: CallbackQuery, redis: Redis, state: FSMContext) -> None:
+    if call.from_user is None:
+        await call.answer()
+        return
     current_state = await state.get_state()
     if current_state is not None:
         raise SkipHandler

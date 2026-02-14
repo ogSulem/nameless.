@@ -17,7 +17,13 @@ class YookassaService:
         self._secret_key = secret_key
         self._auth = base64.b64encode(f"{shop_id}:{secret_key}".encode()).decode()
 
-    async def create_payment(self, amount: int, description: str, return_url: str, metadata: Dict[str, Any]) -> str | None:
+    async def create_payment(
+        self,
+        amount: int,
+        description: str,
+        return_url: str,
+        metadata: Dict[str, Any],
+    ) -> tuple[str | None, str | None]:
         url = f"{self.BASE_URL}/payments"
         headers = {
             "Authorization": f"Basic {self._auth}",
@@ -44,7 +50,7 @@ class YookassaService:
                     logger.error("yookassa_create_failed status=%s body=%s", response.status, text)
                     return None, None
 
-    async def get_payment_status(self, payment_id: str) -> str | None:
+    async def get_payment_status(self, payment_id: str) -> tuple[str | None, bool]:
         url = f"{self.BASE_URL}/payments/{payment_id}"
         headers = {"Authorization": f"Basic {self._auth}"}
 

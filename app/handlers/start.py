@@ -251,12 +251,20 @@ async def _finish_registration(
         existing.city = city
         await session.commit()
         await state.clear()
+        try:
+            await redis.delete(keys.profile_text(int(tg_id)))
+        except Exception:
+            pass
         await show_profile(bot, redis, session, tg_id)
         logger.info("city_changed tg_id=%s", tg_id)
         return
 
     if existing is not None:
         await state.clear()
+        try:
+            await redis.delete(keys.profile_text(int(tg_id)))
+        except Exception:
+            pass
         await show_profile(bot, redis, session, tg_id)
         return
 
@@ -269,6 +277,10 @@ async def _finish_registration(
     await session.commit()
 
     await state.clear()
+    try:
+        await redis.delete(keys.profile_text(int(tg_id)))
+    except Exception:
+        pass
     await show_profile(bot, redis, session, tg_id)
     logger.info("registration_done tg_id=%s", tg_id)
 
@@ -278,3 +290,37 @@ async def change_city(call: CallbackQuery, state: FSMContext, redis: Redis) -> N
     await state.set_state(RegistrationStates.city)
     await edit_ui(call.bot, redis, call.from_user.id, "Укажи новый город или выбери глобальный поиск:", kb=skip_city_kb())
     await call.answer()
+
+
+@router.message()
+async def registration_fallback_entry(message: Message, session: AsyncSession, state: FSMContext, redis: Redis) -> None:
+    # If Redis/FSM state was reset while the user is in the middle of registration,
+    # they may keep sending inputs (e.g. birth date) but handlers won't trigger.
+    # Instead of silently deleting messages via cleanup, restart registration.
+    if message.from_user is None:
+        raise SkipHandler
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        raise SkipHandler
+
+    tg_id = message.from_user.id
+    if await redis.get(keys.active_dialog(tg_id)):
+        raise SkipHandler
+
+    if await redis.get(keys.pending_rating(tg_id)):
+        raise SkipHandler
+
+    if await redis.get(keys.ui_search_message_id(tg_id)):
+        raise SkipHandler
+
+    res = await session.execute(select(User).where(User.telegram_id == tg_id))
+    user = res.scalar_one_or_none()
+    if user is not None:
+        raise SkipHandler
+
+    await _handle_start(message, session, state, redis)
+    try:
+        await message.delete()
+    except Exception:
+        pass

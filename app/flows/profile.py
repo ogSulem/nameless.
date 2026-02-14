@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import User
 from app.keyboards.profile import profile_kb
-from app.services.rating import RatingService
+from app.redis import keys
 from app.ui import edit_ui
 
 
@@ -22,23 +22,25 @@ def _fmt_sub_until(until: datetime | None) -> str:
 
 
 async def show_profile(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int) -> None:
+    cached = None
+    try:
+        cached = await redis.get(keys.profile_text(tg_id))
+    except Exception:
+        cached = None
+    if isinstance(cached, bytes):
+        try:
+            cached = cached.decode("utf-8", errors="replace")
+        except Exception:
+            cached = None
+    if isinstance(cached, str) and cached.strip():
+        await edit_ui(bot, redis, tg_id, cached, kb=profile_kb())
+        return
+
     res = await session.execute(select(User).where(User.telegram_id == tg_id))
     user = res.scalar_one_or_none()
     if user is None:
         await edit_ui(bot, redis, tg_id, "Сначала запусти /start")
         return
-
-    # Force expire existing data to ensure we get fresh state from DB
-    session.expire(user)
-    res = await session.execute(select(User).where(User.telegram_id == tg_id))
-    user = res.scalar_one()
-
-    try:
-        await RatingService().on_rating_saved(session=session, to_user_id=user.id)
-        await session.refresh(user)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception("profile_rating_recalc_failed tg_id=%s", tg_id)
 
     gender = "М" if user.gender.value == "male" else "Ж"
     age = None
@@ -54,10 +56,6 @@ async def show_profile(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int
     if user.subscription_until:
         until_dt = user.subscription_until if user.subscription_until.tzinfo else user.subscription_until.replace(tzinfo=timezone.utc)
         is_premium = until_dt > datetime.now(tz=timezone.utc)
-
-    # RE-FETCH USER TO BE ABSOLUTELY SURE
-    await session.commit() # Commit any pending rating changes
-    await session.refresh(user)
     
     chat_r = float(user.season_rating_chat or 0.0)
     app_r = float(user.season_rating_appearance or 0.0)
@@ -76,5 +74,10 @@ async def show_profile(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int
             "💎 С Premium попадаются собеседники с рейтингом 7+" if not is_premium else "💎 У вас активен Premium статус!",
         ]
     )
+
+    try:
+        await redis.set(keys.profile_text(tg_id), text, ex=10)
+    except Exception:
+        pass
 
     await edit_ui(bot, redis, tg_id, text, kb=profile_kb())

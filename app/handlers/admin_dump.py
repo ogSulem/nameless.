@@ -2,21 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
+from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import Dialog, Message as DbMessage, User
-from app.telegram_safe import safe_send_message
+from app.telegram_safe import safe_send_document, safe_send_message
 from app.utils.markdown import escape_markdown
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_dump")
+
+
+async def _rate_limit(redis: Redis, key: str, ttl_s: int) -> bool:
+    """Return True if allowed, False if rate-limited."""
+    try:
+        ok = await redis.set(key, "1", nx=True, ex=int(ttl_s))
+        return bool(ok)
+    except Exception:
+        # If Redis is down, prefer availability for admins.
+        return True
 
 
 def _split_text(text: str, limit: int = 3500) -> list[str]:
@@ -37,6 +49,22 @@ def _split_text(text: str, limit: int = 3500) -> list[str]:
     if cur:
         parts.append("\n".join(cur))
     return parts
+
+
+def _help_text() -> str:
+    return (
+        "*ADMIN COMMANDS*\n"
+        "- `user <tg_id|db_id>` — профиль + последние сообщения\n"
+        "- `dia <dialog_id>` — выгрузка диалога\n"
+        "- `userfile <tg_id|db_id> [limit]` — выгрузка пользователю в .txt\n"
+        "- `diafile <dialog_id> [limit]` — выгрузка диалога в .txt\n"
+        "- `premium` — сводка premium\n"
+        "- `premium <id> on <days>` — выдать/продлить premium\n"
+        "- `premium <id> off` — снять premium\n"
+        "- `rate <id> <num>` — установить рейтинг чата (0..10)\n"
+        "\n"
+        "Пиши одну команду в одном сообщении. Команды работают и в тексте, и в caption (если пост с медиа)."
+    )
 
 
 async def _tg_label(bot, tg_id: int) -> str:
@@ -93,6 +121,13 @@ async def _dump_user_profile(bot, session: AsyncSession, user: User) -> str:
         f"Created: `{user.created_at.strftime('%Y-%m-%d %H:%M:%S') if user.created_at else '-'}`",
     ]
     return "\n".join(lines)
+
+
+def _safe_filename(name: str) -> str:
+    s = (name or "").strip()
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "_", s)
+    s = s.strip("._-")
+    return s or "dump"
 
 
 async def _set_chat_rating(session: AsyncSession, user: User, value: float) -> None:
@@ -261,45 +296,57 @@ async def _run_broadcast(bot, session: AsyncSession, text: str, admin_chat_id: i
     await safe_send_message(bot, admin_chat_id, report, parse_mode="Markdown")
 
 
-async def _admin_dump_handle(message: Message, session: AsyncSession, settings: Settings) -> None:
+async def _admin_dump_handle(message: Message, session: AsyncSession, settings: Settings, redis: Redis) -> None:
     if not settings.alerts_chat_id:
         raise SkipHandler
 
     if message.chat is None or int(message.chat.id) != int(settings.alerts_chat_id):
         raise SkipHandler
 
+    # Security: require explicit admin user id.
+    if message.from_user is None:
+        raise SkipHandler
+
+    if settings.admins_set and message.from_user.id not in settings.admins_set:
+        raise SkipHandler
+
+    # Mask text in logs to prevent PII leakage (broadcast content, user messages, etc.)
+    raw_text = (message.text or message.caption or "").strip()
+    masked_text = (raw_text[:10] + "...") if len(raw_text) > 10 else raw_text
     logger.info(
-        "admin_dump_incoming chat_id=%s has_from_user=%s text=%r",
+        "admin_dump_incoming chat_id=%s from_tg=%s text_snippet=%r len=%s",
         getattr(message.chat, "id", None),
-        message.from_user is not None,
-        message.text,
+        getattr(message.from_user, "id", None),
+        masked_text,
+        len(raw_text),
     )
 
-    # In channels messages can be sent "as channel" => from_user may be None.
-    # If from_user exists, we enforce ADMINS check. If not, we allow inside alerts channel.
-    if message.from_user is not None:
-        if settings.admins_set and message.from_user.id not in settings.admins_set:
-            raise SkipHandler
-
-    text = (message.text or "").strip()
+    text = (message.text or message.caption or "").strip()
     if not text:
         raise SkipHandler
 
-    parts = text.split()
-    cmd = parts[0].lower() if parts else ""
-    if cmd not in {"user", "dia", "premium", "help", "rate"}:
+    text_norm = text.replace("\n", " ").replace("\r", " ").replace(";", " ").strip()
+    parts = [p for p in text_norm.split() if p]
+    if not parts:
         raise SkipHandler
 
+    cmd = parts[0].lstrip("/").lower()
+    known = {"user", "dia", "userfile", "diafile", "premium", "help", "rate"}
+    if cmd not in known:
+        await safe_send_message(message.bot, message.chat.id, _help_text(), parse_mode="Markdown")
+        return
+
     if cmd == "help":
-        help_text = (
-            "*ADMIN COMMANDS*\n"
-            "- `user <tg_id|db_id>` — профиль + последние сообщения\n"
-            "- `dia <dialog_id>` — выгрузка диалога\n"
-            "- `premium` — сводка premium\n"
-            "- `premium <id> on <days>` — выдать/продлить premium\n"
-            "- `premium <id> off` — снять premium\n"
-        )
-        await safe_send_message(message.bot, message.chat.id, help_text, parse_mode="Markdown")
+        await safe_send_message(message.bot, message.chat.id, _help_text(), parse_mode="Markdown")
+        return
+
+    # Anti-abuse: basic per-admin rate limiting
+    admin_tg = int(message.from_user.id)
+    heavy_cmd = cmd in {"userfile", "diafile"}
+    ttl_s = 30 if heavy_cmd else 2
+    ok = await _rate_limit(redis, key=f"rl:admin_dump:{cmd}:{admin_tg}", ttl_s=ttl_s)
+    if not ok:
+        await safe_send_message(message.bot, message.chat.id, "Слишком часто. Попробуй чуть позже.", parse_mode="Markdown")
         return
 
     if cmd == "rate":
@@ -401,40 +448,66 @@ async def _admin_dump_handle(message: Message, session: AsyncSession, settings: 
         )
         return
 
-    if len(parts) != 2:
-        raise SkipHandler
+    if cmd in {"user", "dia", "userfile", "diafile"}:
+        if len(parts) < 2 or len(parts) > 3:
+            await safe_send_message(message.bot, message.chat.id, _help_text(), parse_mode="Markdown")
+            return
 
-    try:
-        arg = int(parts[1])
-    except Exception:
-        await safe_send_message(message.bot, message.chat.id, "Нужно число: `user <tg_id>` или `dia <dialog_id>`", parse_mode="Markdown")
-        return
+        try:
+            arg = int(parts[1])
+        except Exception:
+            await safe_send_message(message.bot, message.chat.id, "Нужно число: `user <tg_id|db_id>` или `dia <dialog_id>`", parse_mode="Markdown")
+            return
 
-    try:
-        if cmd == "user":
-            user = await _resolve_user(session, arg)
-            if user is None:
-                out = f"Пользователь `{arg}` не найден"
+        limit = None
+        if len(parts) == 3:
+            try:
+                limit = int(parts[2])
+            except Exception:
+                limit = None
+
+        # Clamp to safe bounds to avoid huge dumps and flood limits.
+        if limit is not None:
+            limit = max(1, min(int(limit), 500))
+
+        try:
+            if cmd in {"user", "userfile"}:
+                user = await _resolve_user(session, arg)
+                if user is None:
+                    out = f"Пользователь `{arg}` не найден"
+                else:
+                    prof = await _dump_user_profile(message.bot, session, user)
+                    msgs = await _dump_user(message.bot, session, int(user.telegram_id), limit=limit or 100)
+                    out = prof + "\n\n" + msgs
             else:
-                prof = await _dump_user_profile(message.bot, session, user)
-                msgs = await _dump_user(message.bot, session, int(user.telegram_id))
-                out = prof + "\n\n" + msgs
-        else:
-            out = await _dump_dialog(message.bot, session, arg)
-    except Exception:
-        logger.exception("admin_dump_failed cmd=%s arg=%s", cmd, arg)
-        await safe_send_message(message.bot, message.chat.id, "Ошибка при выгрузке", parse_mode="Markdown")
-        return
+                out = await _dump_dialog(message.bot, session, arg, limit=limit or 50)
+        except Exception:
+            logger.exception("admin_dump_failed cmd=%s arg=%s", cmd, arg)
+            await safe_send_message(message.bot, message.chat.id, "Ошибка при выгрузке", parse_mode="Markdown")
+            return
 
-    for chunk in _split_text(out):
-        await safe_send_message(message.bot, message.chat.id, chunk, parse_mode="Markdown")
+        if cmd in {"userfile", "diafile"}:
+            try:
+                stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+            except Exception:
+                stamp = "now"
+            base = f"{cmd}_{arg}_{stamp}.txt"
+            filename = _safe_filename(base)
+            data = out.encode("utf-8", errors="replace")
+            doc = BufferedInputFile(data, filename=filename)
+            await safe_send_document(message.bot, message.chat.id, document=doc)
+            return
+
+        for chunk in _split_text(out):
+            await safe_send_message(message.bot, message.chat.id, chunk, parse_mode="Markdown")
+        return
 
 
 @router.message()
-async def admin_dump_commands_message(message: Message, session: AsyncSession, settings: Settings) -> None:
-    await _admin_dump_handle(message, session, settings)
+async def admin_dump_commands_message(message: Message, session: AsyncSession, settings: Settings, redis: Redis) -> None:
+    await _admin_dump_handle(message, session, settings, redis)
 
 
 @router.channel_post()
-async def admin_dump_commands_channel_post(message: Message, session: AsyncSession, settings: Settings) -> None:
-    await _admin_dump_handle(message, session, settings)
+async def admin_dump_commands_channel_post(message: Message, session: AsyncSession, settings: Settings, redis: Redis) -> None:
+    await _admin_dump_handle(message, session, settings, redis)

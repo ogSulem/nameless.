@@ -19,6 +19,7 @@ from app.flows.profile import show_profile
 from app.redis import keys
 from app.ui import edit_ui, get_ui_message_id, send_new_ui
 from app.telegram_safe import safe_delete_message
+from app.utils.ratelimit import rate_limit
 
 logger = logging.getLogger(__name__)
 router = Router(name="search")
@@ -55,19 +56,38 @@ def _gender_short(v: str) -> str:
 
 @router.callback_query(F.data == "cancel_search")
 async def cancel_search(call: CallbackQuery, session: AsyncSession, redis: Redis) -> None:
+    if call.from_user is None:
+        await call.answer()
+        return
+
+    ok = await rate_limit(redis, key=f"rl:user:cancel_search:{call.from_user.id}", ttl_s=1)
+    if not ok:
+        await call.answer()
+        return
     res = await session.execute(select(User).where(User.telegram_id == call.from_user.id))
     user = res.scalar_one_or_none()
     if user is not None:
         svc = MatchmakingService(redis)
         await svc.dequeue_from_all(user.telegram_id, user.city)
 
-    await _clear_search_message_id(redis, call.from_user.id)
+    try:
+        await _clear_search_message_id(redis, call.from_user.id)
+    except Exception:
+        pass
     await show_profile(call.bot, redis, session, call.from_user.id)
     await call.answer()
 
 
 @router.callback_query(F.data == "search")
 async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    if call.from_user is None:
+        await call.answer()
+        return
+
+    ok = await rate_limit(redis, key=f"rl:user:search:{call.from_user.id}", ttl_s=2)
+    if not ok:
+        await call.answer()
+        return
     res = await session.execute(select(User).where(User.telegram_id == call.from_user.id))
     user = res.scalar_one_or_none()
     if user is None:
@@ -78,6 +98,11 @@ async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis,
     if user.is_banned:
         await send_new_ui(call.bot, redis, call.from_user.id, "Твой аккаунт заблокирован.")
         await call.answer()
+        # Invalidate cache if somehow it was True
+        try:
+            await redis.delete(keys.user_id_by_tg(call.from_user.id))
+        except Exception:
+            pass
         return
 
     svc = MatchmakingService(redis)
@@ -88,7 +113,10 @@ async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis,
         await edit_ui(call.bot, redis, call.from_user.id, "Ищу собеседника...", kb=cancel_search_kb())
         mid = await get_ui_message_id(redis, call.from_user.id)
         if mid:
-            await _set_search_message_id(redis, call.from_user.id, mid)
+            try:
+                await _set_search_message_id(redis, call.from_user.id, mid)
+            except Exception:
+                pass
         await call.answer()
         return
 
@@ -119,7 +147,10 @@ async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis,
     mid = await _get_search_message_id(redis, user.telegram_id)
     if mid:
         await safe_delete_message(call.bot, user.telegram_id, mid)
-        await _clear_search_message_id(redis, user.telegram_id)
+        try:
+            await _clear_search_message_id(redis, user.telegram_id)
+        except Exception:
+            pass
 
     # card already sends with dialog_reply_kb() via send_new_ui
     await send_new_ui(call.bot, redis, user.telegram_id, my_card, kb=dialog_reply_kb())
@@ -140,7 +171,10 @@ async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis,
         partner_mid = await _get_search_message_id(redis, result.partner_user_id)
         if partner_mid:
             await safe_delete_message(call.bot, result.partner_user_id, partner_mid)
-            await _clear_search_message_id(redis, result.partner_user_id)
+            try:
+                await _clear_search_message_id(redis, result.partner_user_id)
+            except Exception:
+                pass
 
         await send_new_ui(call.bot, redis, result.partner_user_id, partner_card, kb=dialog_reply_kb())
     except Exception:

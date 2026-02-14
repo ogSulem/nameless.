@@ -7,6 +7,9 @@ from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
 from aiogram.types import Update
 
+from app.logging.context import clear_update_id, set_update_id
+from app.metrics import record_update
+
 logger = logging.getLogger(__name__)
 
 class LoggingMiddleware(BaseMiddleware):
@@ -38,6 +41,7 @@ class LoggingMiddleware(BaseMiddleware):
         elif event.channel_post:
             event_type = "channel_post"
 
+        set_update_id(update_id)
         logger.info(
             "update_start update_id=%s user_id=%s type=%s",
             update_id,
@@ -48,6 +52,10 @@ class LoggingMiddleware(BaseMiddleware):
         try:
             result = await handler(event, data)
             duration = (time.perf_counter() - start_time) * 1000
+            try:
+                await record_update(ok=True, duration_ms=duration, slow=duration >= 1500)
+            except Exception:
+                pass
             logger.info(
                 "update_end update_id=%s user_id=%s duration_ms=%.2f",
                 update_id,
@@ -57,6 +65,10 @@ class LoggingMiddleware(BaseMiddleware):
             return result
         except Exception:
             duration = (time.perf_counter() - start_time) * 1000
+            try:
+                await record_update(ok=False, duration_ms=duration, slow=duration >= 1500)
+            except Exception:
+                pass
             logger.error(
                 "update_failed update_id=%s user_id=%s duration_ms=%.2f",
                 update_id,
@@ -64,3 +76,5 @@ class LoggingMiddleware(BaseMiddleware):
                 duration
             )
             raise
+        finally:
+            clear_update_id()

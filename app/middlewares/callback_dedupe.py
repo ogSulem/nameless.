@@ -25,6 +25,9 @@ class CallbackDedupeMiddleware(BaseMiddleware):
         if not isinstance(event, CallbackQuery):
             return await handler(event, data)
 
+        if event.from_user is None:
+            return await handler(event, data)
+
         try:
             # callback.id is unique per update; use it as primary dedupe.
             # Additionally include user id to be safe across chats.

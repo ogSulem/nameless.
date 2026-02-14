@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import traceback
 from typing import Any, Awaitable, Callable, Dict
@@ -35,7 +36,9 @@ class ErrorBoundaryMiddleware(BaseMiddleware):
             # Throttle alerts to avoid spam loops
             try:
                 tb_full = traceback.format_exc()
-                throttle_key = f"alerts:error_throttle:{hash(tb_full[-500:])}"
+                tail = tb_full[-500:].encode("utf-8", errors="ignore")
+                digest = hashlib.sha256(tail).hexdigest()[:16]
+                throttle_key = f"alerts:error_throttle:{digest}"
                 if await self._redis.get(throttle_key):
                     return None
                 await self._redis.set(throttle_key, "1", ex=300)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -7,8 +8,10 @@ from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.types import Message
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+from sqlalchemy.exc import DBAPIError
 
 from app.database.models import ActiveDialog, Dialog, DialogStatus, Message as DbMessage, Photo
 
@@ -27,34 +30,58 @@ class DialogService:
         self._media_root = media_root
 
     async def get_active_dialog(self, session: AsyncSession, dialog_id: int, me_telegram_id: int) -> ActiveDialogInfo | None:
-        dialog = await session.get(Dialog, dialog_id)
-        if dialog is None or dialog.status != DialogStatus.active:
-            return None
-
-        if dialog.user1_id == dialog.user2_id:
-            return None
-
         me_user_id = await self._user_id_by_tg(session, me_telegram_id)
         if me_user_id is None:
             return None
 
-        if me_user_id not in {dialog.user1_id, dialog.user2_id}:
+        from app.database.models import User
+
+        partner_user_id_expr = case(
+            (Dialog.user1_id == me_user_id, Dialog.user2_id),
+            else_=Dialog.user1_id,
+        )
+        Partner = aliased(User)
+
+        res = await session.execute(
+            select(Dialog.id, Dialog.has_photos, Partner.telegram_id)
+            .join(Partner, Partner.id == partner_user_id_expr)
+            .where(Dialog.id == dialog_id)
+            .where(Dialog.status == DialogStatus.active)
+            .where(Dialog.user1_id != Dialog.user2_id)
+            .where((Dialog.user1_id == me_user_id) | (Dialog.user2_id == me_user_id))
+        )
+        row = res.one_or_none()
+        if row is None:
             return None
 
-        partner_user_id = dialog.user2_id if me_user_id == dialog.user1_id else dialog.user1_id
-        partner_tg = await self._tg_id_by_user_id(session, partner_user_id)
-        return ActiveDialogInfo(dialog_id=dialog_id, partner_telegram_id=partner_tg, has_photos=dialog.has_photos)
+        _dialog_id, has_photos, partner_tg = row
+        return ActiveDialogInfo(dialog_id=int(_dialog_id), partner_telegram_id=int(partner_tg), has_photos=bool(has_photos))
 
     async def save_text(self, session: AsyncSession, dialog_id: int, from_user_id: int, text: str) -> None:
-        session.add(DbMessage(dialog_id=dialog_id, from_user_id=from_user_id, text=text))
-        try:
-            await session.commit()
-        except Exception:
+        last_exc: Exception | None = None
+        for i in range(2):
             try:
-                await session.rollback()
-            except Exception:
-                pass
-            raise
+                session.add(DbMessage(dialog_id=dialog_id, from_user_id=from_user_id, text=text))
+                await session.commit()
+                return
+            except DBAPIError as e:
+                last_exc = e
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                if i == 0:
+                    await asyncio.sleep(0.2)
+                continue
+            except Exception as e:
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                raise e
+
+        assert last_exc is not None
+        raise last_exc
 
     async def save_photo(self, bot: Bot, session: AsyncSession, dialog_id: int, owner_user_id: int, tg_id: int, msg: Message) -> str:
         if not msg.photo:
@@ -64,38 +91,55 @@ class DialogService:
         photo = msg.photo[-1]
         file_id = photo.file_id
 
-        db_photo = Photo(dialog_id=dialog_id, owner_user_id=owner_user_id, file_path=f"tg://{file_id}")
-        session.add(db_photo)
-        await session.flush()
-
-        session.add(DbMessage(dialog_id=dialog_id, from_user_id=owner_user_id, photo_id=db_photo.id))
-
-        dialog = await session.get(Dialog, dialog_id)
-        if dialog is not None and not dialog.has_photos:
-            dialog.has_photos = True
-
-        try:
-            await session.commit()
-        except Exception:
+        last_exc: Exception | None = None
+        for i in range(2):
             try:
-                await session.rollback()
-            except Exception:
-                pass
-            raise
-        logger.info("photo_reference_saved dialog_id=%s owner_tg=%s file_id=%s", dialog_id, tg_id, file_id)
-        return file_id
+                db_photo = Photo(dialog_id=dialog_id, owner_user_id=owner_user_id, file_path=f"tg://{file_id}")
+                session.add(db_photo)
+                await session.flush()
+
+                session.add(DbMessage(dialog_id=dialog_id, from_user_id=owner_user_id, photo_id=db_photo.id))
+
+                dialog = await session.get(Dialog, dialog_id)
+                if dialog is not None and not dialog.has_photos:
+                    dialog.has_photos = True
+
+                await session.commit()
+                logger.info("photo_reference_saved dialog_id=%s owner_tg=%s file_id=%s", dialog_id, tg_id, file_id)
+                return file_id
+            except DBAPIError as e:
+                last_exc = e
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                if i == 0:
+                    await asyncio.sleep(0.2)
+                continue
+            except Exception as e:
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                raise e
+
+        assert last_exc is not None
+        raise last_exc
 
     async def finish_dialog(self, session: AsyncSession, dialog_id: int) -> Dialog | None:
         dialog = await session.get(Dialog, dialog_id)
         if dialog is None:
             return None
         if dialog.status != DialogStatus.active:
+            # Already finished or in other terminal state
             return dialog
 
         dialog.status = DialogStatus.finished
         dialog.finished_at = datetime.now(tz=timezone.utc)
 
+        # Remove from ActiveDialog table to allow users to search again
         await session.execute(delete(ActiveDialog).where(ActiveDialog.dialog_id == dialog_id))
+        
         try:
             await session.commit()
         except Exception:
