@@ -50,6 +50,7 @@ class ErrorBoundaryMiddleware(BaseMiddleware):
                 if bot is None:
                     bot = getattr(event, "bot", None)
                 if bot is None:
+                    logger.warning("error_boundary: bot instance not found in event or data")
                     return None
 
                 from_user = getattr(event, "from_user", None)
@@ -76,6 +77,7 @@ class ErrorBoundaryMiddleware(BaseMiddleware):
                 if len(msg) > 3900:
                     msg = msg[:3900]
 
+                logger.info("error_boundary: sending alert to %s", alerts_chat_id)
                 await safe_send_message(
                     bot,
                     int(alerts_chat_id),
@@ -83,7 +85,7 @@ class ErrorBoundaryMiddleware(BaseMiddleware):
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
-            except Exception:
-                logger.exception("failed_send_alert")
+            except Exception as e:
+                logger.exception("failed_send_alert alerts_chat_id=%s error=%s", alerts_chat_id, e)
 
             return None

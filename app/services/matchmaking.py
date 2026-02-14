@@ -133,7 +133,8 @@ class MatchmakingService:
             async def _attempt_match(from_queues: list[str]) -> User | None:
                 nonlocal partner_lock_key
 
-                best_candidate: User | None = None
+                best_candidate_id: int | None = None
+                best_candidate_tg: int | None = None
                 best_rating: float = -1.0
 
                 for _ in range(max_attempts):
@@ -212,10 +213,6 @@ class MatchmakingService:
                     return MatchResult(dialog_id=0, partner_user_id=best_candidate_tg, _temp_partner_id=best_candidate_id)
                 return None
 
-            # Need to store IDs for the actual match creation outside _attempt_match
-            best_candidate_id: int | None = None
-            best_candidate_tg: int | None = None
-            
             partner_info: MatchResult | None = None
             if user.city and city_queues:
                 partner_info = await _attempt_match(city_queues)
@@ -229,6 +226,7 @@ class MatchmakingService:
                 return None
 
             partner_tg = partner_info.partner_user_id
+            # Retrieve the temporary ID we stored in MatchResult
             partner_db_id = getattr(partner_info, "_temp_partner_id", None)
 
             dialog = Dialog(user1_id=user.id, user2_id=partner_db_id, status=DialogStatus.active)
@@ -251,15 +249,15 @@ class MatchmakingService:
             try:
                 pipe = self._redis.pipeline(transaction=False)
                 pipe.set(keys.active_dialog(int(user.telegram_id)), str(dialog.id), ex=60 * 60 * 12)
-                pipe.set(keys.active_dialog(int(partner.telegram_id)), str(dialog.id), ex=60 * 60 * 12)
+                pipe.set(keys.active_dialog(int(partner_tg)), str(dialog.id), ex=60 * 60 * 12)
 
                 ttl = 60 * 60 * 12
-                pipe.set(keys.dialog_partner_tg(dialog.id, int(user.telegram_id)), str(int(partner.telegram_id)), ex=ttl)
-                pipe.set(keys.dialog_partner_tg(dialog.id, int(partner.telegram_id)), str(int(user.telegram_id)), ex=ttl)
+                pipe.set(keys.dialog_partner_tg(dialog.id, int(user.telegram_id)), str(int(partner_tg)), ex=ttl)
+                pipe.set(keys.dialog_partner_tg(dialog.id, int(partner_tg)), str(int(user.telegram_id)), ex=ttl)
 
                 # Reset rating/appearance-related state for a fresh dialog.
                 # This prevents leaking pending steps/flags between different partners.
-                for tg in (int(user.telegram_id), int(partner.telegram_id)):
+                for tg in (int(user.telegram_id), int(partner_tg)):
                     pipe.delete(keys.pending_rating(tg))
                     pipe.delete(keys.pending_rating_has_photos(tg))
                     pipe.delete(keys.pending_rating_partner(tg))
@@ -267,20 +265,20 @@ class MatchmakingService:
                     pipe.delete(keys.pending_rating_step(tg))
 
                 pipe.delete(keys.appearance_rating_required(int(user.telegram_id), dialog.id))
-                pipe.delete(keys.appearance_rating_required(int(partner.telegram_id), dialog.id))
+                pipe.delete(keys.appearance_rating_required(int(partner_tg), dialog.id))
                 await pipe.execute()
             except Exception:
-                logger.exception("failed_set_active_dialog_cache user_tg=%s partner_tg=%s", user.telegram_id, partner.telegram_id)
+                logger.exception("failed_set_active_dialog_cache user_tg=%s partner_tg=%s", user.telegram_id, partner_tg)
 
             logger.info(
                 "match_created dialog_id=%s u1=%s u2=%s premium=%s",
                 dialog.id,
                 user.telegram_id,
-                partner.telegram_id,
+                partner_tg,
                 premium,
             )
 
-            return MatchResult(dialog_id=dialog.id, partner_user_id=partner.telegram_id)
+            return MatchResult(dialog_id=dialog.id, partner_user_id=partner_tg)
         finally:
             await self._redis.delete(lock_key)
             if partner_lock_key:
