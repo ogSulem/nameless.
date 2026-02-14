@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import warnings
 
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
@@ -83,7 +84,11 @@ async def _close_redis(redis) -> None:
     if redis is None:
         return
     try:
-        await redis.close()
+        # Use aclose() for newer redis-py versions to avoid DeprecationWarning
+        if hasattr(redis, "aclose"):
+            await redis.aclose()
+        else:
+            await redis.close()
     except Exception:
         pass
     try:
@@ -226,4 +231,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Silencing Pydantic V2 warnings from aiogram about "model_" protected namespace
+    warnings.filterwarnings("ignore", message='Field "model_custom_emoji_id" in UniqueGiftColors has conflict with protected namespace "model_".')
+    
     asyncio.run(main())
