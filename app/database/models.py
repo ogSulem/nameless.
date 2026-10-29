@@ -68,11 +68,6 @@ class User(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
-    # Premium matching filters (paid perk; ignored when Premium is not active).
-    filter_age_min: Mapped[int] = mapped_column(Integer, nullable=False, server_default="18")
-    filter_age_max: Mapped[int] = mapped_column(Integer, nullable=False, server_default="99")
-    filter_city_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
-
     # Growth: who invited this user (telegram id) and whether the bonus was paid.
     invited_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     invite_rewarded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))

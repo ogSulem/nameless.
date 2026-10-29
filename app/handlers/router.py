@@ -6,7 +6,6 @@ from app.handlers.admin import router as admin_router
 from app.handlers.commands import router as commands_router
 from app.handlers.dialog import router as dialog_router
 from app.handlers.fallback import router as fallback_router
-from app.handlers.filters import router as filters_router
 from app.handlers.promo import router as promo_router
 from app.handlers.rating import router as rating_router
 from app.handlers.search import router as search_router
@@ -26,7 +25,6 @@ def build_router() -> Router:
     root.include_router(admin_router)
     root.include_router(promo_router)
     root.include_router(search_router)
-    root.include_router(filters_router)
     root.include_router(rating_router)
     root.include_router(subscription_router)
     root.include_router(dialog_router)

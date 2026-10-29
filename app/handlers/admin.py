@@ -87,18 +87,12 @@ async def show_admin_menu(
         return
 
     s = await service.stats(session)
-    from app.services.activity import conversion, today
-
-    searches = await today(redis, "search")
-    matches = await today(redis, "match")
     text = "\n".join(
         [
             "<b>🛠 Админ-панель Nameless</b>",
             f"Роль: <b>{ROLE_TITLES[role]}</b>",
             "",
             f"👥 Пользователи: <b>{s.users}</b> · 🟢 за 24ч: <b>{s.active_24h}</b>",
-            f"🔎 Поисков сегодня: <b>{searches}</b> · 🤝 Матчей: <b>{matches}</b> · "
-            f"конверсия: <b>{conversion(searches, matches)}%</b>",
             f"💬 Диалоги сейчас: <b>{s.dialogs_active}</b> · сегодня: <b>{s.dialogs_today}</b>",
             f"🚨 Жалоб в очереди: <b>{s.complaints_open}</b>",
             "",
@@ -123,15 +117,7 @@ async def adm_stats(call: CallbackQuery, session: AsyncSession, redis: Redis, se
     if await _require(call, settings, Role.support) is None:
         return
     s = await service.stats(session)
-    from app.services.activity import today
-
-    text = service.stats_text(
-        s,
-        settings,
-        searches_today=await today(redis, "search"),
-        matches_today=await today(redis, "match"),
-    )
-    await _render(call.bot, redis, int(call.from_user.id), text, back_menu_kb(), call=call)
+    await _render(call.bot, redis, int(call.from_user.id), service.stats_text(s, settings), back_menu_kb(), call=call)
     await safe_answer_callback(call)
 
 

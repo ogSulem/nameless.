@@ -62,11 +62,6 @@ def profile_text(user: User, settings: Settings, premium_mode: str = "chat") -> 
             until = until.replace(tzinfo=UTC)
         mode_label = "внешность" if premium_mode == "appearance" else "общение"
         lines.append(f"💎 Premium до <b>{until:%d.%m.%Y}</b> · подбор по: <b>{mode_label}</b>")
-        age_min = int(user.filter_age_min or 18)
-        age_max = int(user.filter_age_max or 99)
-        age_label = "любой" if (age_min, age_max) == (18, 99) else f"{age_min}–{age_max}"
-        city_label = "только мой город" if user.filter_city_only else "вся страна"
-        lines.append(f"🎛 Фильтры: возраст <b>{age_label}</b> · <b>{city_label}</b>")
     elif settings.payments_enabled:
         lines.append("💎 Premium: собеседники с высоким рейтингом и приоритет в подборе")
 

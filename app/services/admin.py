@@ -114,24 +114,13 @@ async def stats(session: AsyncSession) -> Stats:
     )
 
 
-def stats_text(
-    s: Stats, settings: Settings, *, searches_today: int | None = None, matches_today: int | None = None
-) -> str:
-    funnel = ""
-    if searches_today is not None and matches_today is not None:
-        from app.services.activity import conversion
-
-        funnel = (
-            f"🔎 Поисков сегодня: <b>{searches_today}</b> · 🤝 Матчей: <b>{matches_today}</b> · "
-            f"конверсия: <b>{conversion(searches_today, matches_today)}%</b>\n"
-        )
+def stats_text(s: Stats, settings: Settings) -> str:
     return (
         "<b>📊 Панель Nameless</b>\n"
         f"<i>{utcnow():%d.%m.%Y %H:%M} UTC</i>\n\n"
         f"👥 Пользователи: <b>{s.users}</b> (+{s.new_today} сегодня)\n"
         f"🟢 Активны за 24ч: <b>{s.active_24h}</b>\n\n"
-        + funnel
-        + f"💬 Диалогов сегодня: <b>{s.dialogs_today}</b> · сейчас: <b>{s.dialogs_active}</b>\n"
+        f"💬 Диалогов сегодня: <b>{s.dialogs_today}</b> · сейчас: <b>{s.dialogs_active}</b>\n"
         f"✉️ Сообщений сегодня: <b>{s.messages_today}</b>\n"
         f"⭐ Оценок сегодня: <b>{s.ratings_today}</b> · средний рейтинг: <b>{s.avg_rating:.2f}</b>\n\n"
         f"💎 Premium: <b>{s.premium}</b> · выручка 30д: <b>{s.revenue_month_rub:.0f} ₽</b>\n"

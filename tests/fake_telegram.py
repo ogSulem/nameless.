@@ -34,7 +34,6 @@ def fresh_router():
         commands,
         dialog,
         fallback,
-        filters,
         promo,
         rating,
         search,
@@ -42,7 +41,7 @@ def fresh_router():
     )
     from app.handlers.router import build_router
 
-    for module in (commands, admin, promo, filters, search, rating, subscription, dialog, fallback):
+    for module in (commands, admin, promo, search, rating, subscription, dialog, fallback):
         module.router._parent_router = None  # noqa: SLF001 - test-only detach
     return build_router()
 

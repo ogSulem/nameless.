@@ -4,7 +4,6 @@ from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
 NEXT = "⏭️ Следующий"
 STOP = "🛑 Завершить"
-REPORT = "🚨 Жалоба"
 
 
 def dialog_reply_kb() -> ReplyKeyboardMarkup:
@@ -14,10 +13,7 @@ def dialog_reply_kb() -> ReplyKeyboardMarkup:
     what each button does.
     """
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=NEXT), KeyboardButton(text=STOP)],
-            [KeyboardButton(text=REPORT)],
-        ],
+        keyboard=[[KeyboardButton(text=NEXT), KeyboardButton(text=STOP)]],
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
