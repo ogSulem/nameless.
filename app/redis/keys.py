@@ -37,6 +37,14 @@ def lock_rating(tg_id: int) -> str:
 
 
 # -------------------------------------------------------------------- dialog
+def promo_attempt_key(tg_id: int) -> str:
+    return f"promo:try:{tg_id}"
+
+
+def referral_cap_key(tg_id: int, day: str) -> str:
+    return f"ref:cap:{tg_id}:{day}"
+
+
 def premium_pref_key(tg_id: int) -> str:
     return f"premium_pref:{int(tg_id)}"
 

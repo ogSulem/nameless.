@@ -269,6 +269,48 @@ class Payment(Base):
     )
 
 
+class PromoCode(Base):
+    """A free-Premium promo code. Every code has a hard usage cap and an expiry.
+
+    Codes are the honest alternative to "fake users": they cost nothing until the
+    person actually shows up, and they are fully traceable in the admin panel.
+    """
+
+    __tablename__ = "promo_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False, server_default="30")
+    max_uses: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    note: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (Index("ix_promo_codes_active", "is_active", "expires_at"),)
+
+
+class PromoRedemption(Base):
+    """Who used which code. The unique pair is what makes "one per person" real."""
+
+    __tablename__ = "promo_redemptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("promo_codes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("code_id", "telegram_id", name="ux_promo_redemption_user"),
+        Index("ix_promo_redemptions_tg", "telegram_id"),
+    )
+
+
 class AdminAudit(Base):
     """Who did what in the admin panel. Legal mitigation for moderation access."""
 

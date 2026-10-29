@@ -23,8 +23,8 @@ from app.services import admin as admin_service
 from app.services.city_validator import sanitize_city
 from app.services.dialog import DialogService
 from app.services.matchmaking import MatchmakingService
-from app.telegram_safe import safe_answer_callback
-from app.texts import help_text, privacy_text, rules_text, terms_text
+from app.telegram_safe import safe_answer_callback, safe_send_message
+from app.texts import days_label, help_text, privacy_text, rules_text, terms_text
 from app.ui import edit_ui, send_new_ui
 
 logger = logging.getLogger(__name__)
@@ -473,43 +473,86 @@ async def _pay_referral(
     invitee (`invite_rewarded`), so a replayed /start cannot farm days.
     """
     days = int(settings.referral_reward_days)
-    if days <= 0 or invitee.invite_rewarded:
+    if invitee.invite_rewarded:
+        return
+    if days <= 0 and int(settings.referral_welcome_days) <= 0:
         return
 
     inviter = await get_user(session, inviter_tg)
-    if inviter is None or inviter.is_banned:
+    if inviter is None or inviter.is_banned or int(inviter.telegram_id) == int(invitee.telegram_id):
         return
 
     from app.services import admin as admin_service
     from app.services.subscription import SubscriptionService
 
+    # Anti-farming: a SIM farm cannot turn into a month of Premium per minute.
+    cap = int(settings.referral_max_per_day)
+    if cap > 0:
+        today = datetime.now(tz=UTC).strftime("%Y%m%d")
+        cap_key = keys.referral_cap_key(inviter_tg, today)
+        try:
+            paid_today = int(await redis.incr(cap_key))
+            if paid_today == 1:
+                await redis.expire(cap_key, 172800)
+            if paid_today > cap:
+                logger.info("referral_cap_hit inviter=%s", inviter_tg)
+                return
+        except Exception:
+            logger.warning("referral_cap_failed inviter=%s", inviter_tg, exc_info=True)
+
     invitee.invite_rewarded = True
     await session.commit()
 
-    until = await SubscriptionService().extend_subscription(
-        session=session, telegram_id=inviter_tg, days=days
-    )
-    await MatchmakingService(redis, settings).invalidate_premium(inviter_tg)
-    await admin_service.log_action(
-        session,
-        admin_tg=0,
-        action="referral_bonus",
-        target_tg=inviter_tg,
-        details=f"+{days}d за приглашённого {invitee.telegram_id}",
-    )
-    try:
-        # Replaces the inviter's current screen, so the chat stays at one message.
-        await send_new_ui(
-            bot,
-            redis,
-            inviter_tg,
-            f"🎁 <b>+{days} дней Premium</b> за приглашённого друга!\n\n"
-            f"Теперь Premium активен до <b>{until:%d.%m.%Y}</b>.",
-            kb=back_kb("menu:profile"),
+    welcome = int(settings.referral_welcome_days)
+
+    if days > 0:
+        until = await SubscriptionService().extend_subscription(
+            session=session, telegram_id=inviter_tg, days=days
         )
-    except Exception:
-        logger.info("referral_notify_failed tg=%s", inviter_tg)
-    logger.info("referral_paid inviter=%s invitee=%s days=%s", inviter_tg, invitee.telegram_id, days)
+        await MatchmakingService(redis, settings).invalidate_premium(inviter_tg)
+        await admin_service.log_action(
+            session,
+            admin_tg=0,
+            action="referral_bonus",
+            target_tg=inviter_tg,
+            details=f"+{days}d за приглашённого {invitee.telegram_id}",
+        )
+        try:
+            # Replaces the inviter's current screen, so the chat stays at one message.
+            await send_new_ui(
+                bot,
+                redis,
+                inviter_tg,
+                f"🎁 <b>+{days_label(days)} Premium</b> за приглашённого друга!\n\n"
+                f"Теперь Premium активен до <b>{until:%d.%m.%Y}</b>.",
+                kb=back_kb("menu:profile"),
+            )
+        except Exception:
+            logger.info("referral_notify_failed tg=%s", inviter_tg)
+
+    # The invited person gets a taste too — off by default, on for launch week.
+    if welcome > 0:
+        try:
+            await SubscriptionService().extend_subscription(
+                session=session, telegram_id=int(invitee.telegram_id), days=welcome
+            )
+            await MatchmakingService(redis, settings).invalidate_premium(int(invitee.telegram_id))
+            await safe_send_message(
+                bot,
+                int(invitee.telegram_id),
+                f"🎁 Вам <b>{welcome} дней Premium</b> — приветственный бонус за вход по ссылке друга.\n\n"
+                "Подбор Premium настраивается в профиле.",
+            )
+        except Exception:
+            logger.info("referral_welcome_failed tg=%s", invitee.telegram_id)
+
+    logger.info(
+        "referral_paid inviter=%s invitee=%s days=%s welcome=%s",
+        inviter_tg,
+        invitee.telegram_id,
+        days,
+        welcome,
+    )
 
 
 async def _invite_screen(bot: Bot, redis: Redis, session: AsyncSession, settings: Settings, tg_id: int) -> None:
@@ -539,8 +582,8 @@ async def _invite_screen(bot: Bot, redis: Redis, session: AsyncSession, settings
     await edit_ui(
         bot, redis, tg_id,
         "🎁 <b>Пригласите друга</b>\n\n"
-        f"За каждого друга, который зарегистрируется по ссылке, вы получаете "
-        f"<b>+{reward} дней Premium</b>.\n\n"
+        f"За каждого нового друга, который зарегистрируется по ссылке, вы получаете "
+        f"<b>+{days_label(reward)} Premium</b>.\n\n"
         f"Уже приглашено: <b>{invited}</b>\n\n"
         f"<code>{invite_link(username, tg_id)}</code>\n\n"
         "<i>Награда начисляется один раз за каждого нового пользователя.</i>",

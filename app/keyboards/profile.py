@@ -25,7 +25,12 @@ def profile_kb(
             InlineKeyboardButton(text="👀 Кого ищем", callback_data="profile:seek"),
         ]
     )
-    rows.append([InlineKeyboardButton(text="🎁 Позвать друга (+Premium)", callback_data="menu:invite")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="🎁 Позвать друга", callback_data="menu:invite"),
+            InlineKeyboardButton(text="🎟 Промокод", callback_data="menu:promo"),
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help"),

@@ -49,7 +49,14 @@ class Settings(BaseSettings):
 
     # --- Growth -------------------------------------------------------------
     # Premium days for inviting a friend. 0 disables the reward (invites still work).
-    referral_reward_days: int = Field(default=7, alias="REFERRAL_REWARD_DAYS")
+    referral_reward_days: int = Field(default=30, alias="REFERRAL_REWARD_DAYS")
+    # Welcome bonus for the invited person (0 = off). Meant for the launch week.
+    referral_welcome_days: int = Field(default=0, alias="REFERRAL_WELCOME_DAYS")
+    # Anti-farming: how many referral rewards one inviter can earn per day.
+    referral_max_per_day: int = Field(default=5, alias="REFERRAL_MAX_PER_DAY")
+
+    # Promo codes (free Premium campaigns). Wrong guesses per user per hour.
+    promo_attempts_per_hour: int = Field(default=10, alias="PROMO_ATTEMPTS_PER_HOUR")
 
     # --- Anti-flood ---------------------------------------------------------
     messages_per_10s: int = Field(default=12, alias="MESSAGES_PER_10S")

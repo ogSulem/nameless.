@@ -19,6 +19,7 @@ from app.keyboards.admin import (
     complaint_card_kb,
     complaints_list_kb,
     dialogs_kb,
+    promos_kb,
     user_card_kb,
 )
 from app.services import admin as service
@@ -516,3 +517,166 @@ async def adm_maintenance(call: CallbackQuery, session: AsyncSession, redis: Red
     )
     await _render(call.bot, redis, int(call.from_user.id), text, back_menu_kb(), call=call)
     await safe_answer_callback(call, "Готово")
+
+
+# ------------------------------------------------------------------ promo codes
+def _promo_text(rows) -> str:
+    if not rows:
+        return (
+            "<b>🎟 Промокоды</b>\n\n"
+            "Кодов нет.\n\n"
+            "<i>Нажмите «➕ Создать код», чтобы выдать бесплатный Premium.</i>"
+        )
+    lines = ["<b>🎟 Промокоды</b>", ""]
+    for r in rows:
+        state = "✅" if r.is_active else "🚫"
+        until = f"до {r.expires_at:%d.%m.%Y}" if r.expires_at else "без срока"
+        note = f" · {escape(r.note)}" if r.note else ""
+        lines.append(
+            f"{state} <code>{escape(r.code)}</code> · {r.days} дн · "
+            f"{r.used_count}/{r.max_uses} · {until}{note}"
+        )
+    lines += ["", "<i>Нажмите на код, чтобы включить или отключить его.</i>"]
+    return "\n".join(lines)
+
+
+async def _render_promos(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int, *, call=None) -> None:
+    from app.services import promo as promo_service
+
+    rows = await promo_service.list_codes(session, limit=10)
+    await _render(
+        bot,
+        redis,
+        tg_id,
+        _promo_text(rows),
+        promos_kb([(r.id, r.is_active) for r in rows]),
+        call=call,
+    )
+
+
+@router.callback_query(F.data == "adm:promo")
+async def adm_promo(
+    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    if await _require(call, settings, Role.admin) is None:
+        return
+    await _render_promos(call.bot, redis, session, int(call.from_user.id), call=call)
+    await safe_answer_callback(call)
+
+
+@router.callback_query(F.data == "adm:promo_new")
+async def adm_promo_new(
+    call: CallbackQuery, state: FSMContext, redis: Redis, settings: Settings
+) -> None:
+    if await _require(call, settings, Role.admin) is None:
+        return
+    await state.set_state(AdminPanel.waiting_promo)
+    await edit_ui(
+        call.bot,
+        redis,
+        int(call.from_user.id),
+        "<b>🎟 Новый промокод</b>\n\n"
+        "Пришлите: <code>код дней активаций срок_дней</code>\n\n"
+        "Например: <code>START30 30 100 30</code> — код <b>START30</b>, "
+        "30 дней Premium, 100 активаций, живёт 30 дней.\n\n"
+        "Вместо кода можно написать <code>_</code> — сгенерирую случайный.\n"
+        "Срок <code>0</code> — бессрочно.",
+        kb=back_menu_kb(),
+    )
+    await safe_answer_callback(call)
+
+
+def _parse_promo_input(raw: str) -> tuple[str, int, int, int | None]:
+    from app.services.promo import generate_code
+
+    parts = raw.split()
+    if len(parts) < 3 or len(parts) > 4:
+        raise ValueError("format")
+    code = parts[0].strip()
+    if code in {"_", "-", "auto"}:
+        code = generate_code()
+    days = int(parts[1])
+    uses = int(parts[2])
+    valid = int(parts[3]) if len(parts) == 4 else 30
+    return code, days, uses, (None if valid == 0 else valid)
+
+
+@router.message(AdminPanel.waiting_promo)
+async def adm_promo_create(
+    message: Message, state: FSMContext, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    if message.from_user is None:
+        return
+    if role_for(settings, int(message.from_user.id)) is None:
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    tg_id = int(message.from_user.id)
+    try:
+        code, days, uses, valid = _parse_promo_input(raw)
+    except (ValueError, TypeError):
+        await edit_ui(
+            message.bot,
+            redis,
+            tg_id,
+            "Не разобрал. Формат: <code>КОД ДНЕЙ АКТИВАЦИЙ СРОК</code>, "
+            "например <code>START30 30 100 30</code>.",
+            kb=back_menu_kb(),
+        )
+        return
+
+    from app.services import promo as promo_service
+
+    promo, error = await promo_service.create_code(
+        session,
+        code=code,
+        days=days,
+        max_uses=uses,
+        valid_days=valid,
+        created_by=tg_id,
+    )
+    if promo is None:
+        await edit_ui(message.bot, redis, tg_id, f"❌ {escape(error or 'Не получилось.')}", kb=back_menu_kb())
+        return
+
+    await service.log_action(
+        session,
+        admin_tg=tg_id,
+        action="promo_create",
+        details=f"{promo.code} days={promo.days} uses={promo.max_uses}",
+    )
+    await state.clear()
+    await _render_promos(message.bot, redis, session, tg_id)
+
+
+@router.callback_query(F.data.startswith("adm:promo_toggle:"))
+async def adm_promo_toggle(
+    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    if await _require(call, settings, Role.admin) is None:
+        return
+    code_id = _tail_int(call.data, 2)
+    if code_id is None:
+        await safe_answer_callback(call, "Не понял, какой код.")
+        return
+
+    from app.services import promo as promo_service
+
+    promo = await promo_service.toggle_active(session, code_id)
+    if promo is None:
+        await safe_answer_callback(call, "Код не найден")
+        return
+    await service.log_action(
+        session,
+        admin_tg=int(call.from_user.id),
+        action="promo_enable" if promo.is_active else "promo_disable",
+        details=promo.code,
+    )
+    await _render_promos(call.bot, redis, session, int(call.from_user.id), call=call)
+    await safe_answer_callback(call, "Включён" if promo.is_active else "Отключён")

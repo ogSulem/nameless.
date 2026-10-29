@@ -16,6 +16,7 @@ def admin_menu_kb(*, role: str, open_complaints: int = 0) -> InlineKeyboardMarku
     ]
     if role == "admin":
         rows.append([InlineKeyboardButton(text="💰 Платежи", callback_data="adm:payments")])
+        rows.append([InlineKeyboardButton(text="🎟 Промокоды", callback_data="adm:promo")])
         rows.append([InlineKeyboardButton(text="📜 Журнал действий", callback_data="adm:audit:0")])
     rows.append([InlineKeyboardButton(text="♻️ Обслуживание", callback_data="adm:maintenance")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -96,3 +97,19 @@ def complaints_list_kb(
 
 def back_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="← В меню", callback_data="adm:menu")]])
+
+
+def promos_kb(rows: list[tuple[int, bool]]) -> InlineKeyboardMarkup:
+    """One row per promo: tap to enable/disable it."""
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"{'🚫' if not active else '✅'} #{code_id}",
+                callback_data=f"adm:promo_toggle:{code_id}",
+            )
+        ]
+        for code_id, active in rows
+    ]
+    buttons.append([InlineKeyboardButton(text="➕ Создать код", callback_data="adm:promo_new")])
+    buttons.append([InlineKeyboardButton(text="← В меню", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

@@ -22,6 +22,11 @@ class Complaint(StatesGroup):
 
 class AdminPanel(StatesGroup):
     waiting_user_id = State()
+    waiting_promo = State()
+
+
+class Promo(StatesGroup):
+    waiting_code = State()
 
 
 class Payment(StatesGroup):
