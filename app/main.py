@@ -49,6 +49,8 @@ COMMANDS = [
     BotCommand(command="start", description="Профиль и поиск собеседника"),
     BotCommand(command="stop", description="Завершить поиск или диалог"),
     BotCommand(command="premium", description="Подписка Premium"),
+    BotCommand(command="invite", description="Позвать друга и получить Premium"),
+    BotCommand(command="promo", description="Активировать промокод"),
     BotCommand(command="help", description="Как всё работает"),
     BotCommand(command="privacy", description="Политика обработки данных"),
     BotCommand(command="terms", description="Условия использования"),
