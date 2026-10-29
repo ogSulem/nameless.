@@ -60,6 +60,10 @@ async def start_search_for(
     if await DialogService(redis, settings).active_dialog_id(session, tg_id):
         return False
 
+    from app.services.activity import bump
+
+    await bump(redis, "search")
+
     matchmaking = MatchmakingService(redis, settings)
     premium = await matchmaking.is_premium(session, user)
     result = await matchmaking.try_match(session=session, user=user, premium=premium)

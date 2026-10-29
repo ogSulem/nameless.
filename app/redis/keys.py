@@ -57,6 +57,16 @@ def dialog_partner_tg(dialog_id: int, my_tg_id: int) -> str:
     return f"dialog:{dialog_id}:partner_tg:{my_tg_id}"
 
 
+def recent_partners_key(tg_id: int) -> str:
+    """Last few partners: nobody wants the same stranger twice in a row."""
+    return f"recent_partners:{int(tg_id)}"
+
+
+def no_match_key(tg_id: int) -> str:
+    """People who complained about this user (and vice versa) are never paired again."""
+    return f"no_match:{int(tg_id)}"
+
+
 def last_partner(tg_id: int) -> str:
     return f"last_partner:{tg_id}"
 

@@ -96,7 +96,7 @@ class Settings(BaseSettings):
 
     # --- Legal / retention --------------------------------------------------
     min_age: int = Field(default=18, alias="MIN_AGE")
-    terms_version: str = Field(default="1.0", alias="TERMS_VERSION")
+    terms_version: str = Field(default="1.1", alias="TERMS_VERSION")
     operator_name: str = Field(default="", alias="OPERATOR_NAME")
     support_contact: str = Field(default="", alias="SUPPORT_CONTACT")
     retention_message_days: int = Field(default=30, alias="RETENTION_MESSAGE_DAYS")

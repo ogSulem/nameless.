@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -21,6 +21,38 @@ MAX_RESERVE_ATTEMPTS = 25
 PREMIUM_PROBE = 6
 # Premium profiles are pushed to the front of the queue (~2 minutes of head start).
 PREMIUM_QUEUE_BOOST_S = 120
+# Nobody wants the same stranger three times in a row.
+RECENT_PARTNERS_MAX = 3
+RECENT_TTL_S = 60 * 60 * 24 * 7
+# After a complaint the pair is never matched again (both directions).
+NO_MATCH_TTL_S = 60 * 60 * 24 * 30
+DEFAULT_AGE_MIN = 18
+DEFAULT_AGE_MAX = 99
+
+
+def age_from(birth_date: date | None) -> int:
+    if birth_date is None:
+        return DEFAULT_AGE_MIN
+    today = datetime.now(tz=UTC).date()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+
+
+@dataclass(frozen=True, slots=True)
+class MatchFilters:
+    """Who a user wants to meet. Only Premium users get to change it."""
+
+    age_min: int = DEFAULT_AGE_MIN
+    age_max: int = DEFAULT_AGE_MAX
+    city_only: bool = False
+
+    def fits(self, *, age: int, my_city: str | None, their_city: str | None) -> bool:
+        if not self.age_min <= age <= self.age_max:
+            return False
+        if self.city_only and my_city:
+            if not their_city:
+                return True  # "вся страна" still counts: we cannot ask them to move
+            return my_city.strip().lower() == their_city.strip().lower()
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +60,17 @@ class MatchResult:
     dialog_id: int
     partner_telegram_id: int
     partner_db_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Profile:
+    """The searching side, flattened: what they are and what they accept."""
+
+    age: int
+    gender: str
+    city: str | None
+    premium: bool
+    filters: MatchFilters
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +237,20 @@ class MatchmakingService:
         queues.append(keys.queue_key(seek, None))
 
         mode = await self.premium_mode(tg) if premium else "chat"
-        candidate = await self._pick_candidate(session, user, queues, premium, mode)
+        profile = _Profile(
+            age=age_from(user.birth_date),
+            gender=getattr(user.gender, "value", user.gender),
+            city=user.city,
+            premium=premium,
+            filters=MatchFilters(
+                age_min=int(user.filter_age_min or DEFAULT_AGE_MIN),
+                age_max=int(user.filter_age_max or DEFAULT_AGE_MAX),
+                city_only=bool(user.filter_city_only),
+            )
+            if premium
+            else MatchFilters(),
+        )
+        candidate = await self._pick_candidate(session, user, queues, premium, mode, profile)
         if candidate is None:
             await self.enqueue(session, user)
             logger.info("match_enqueued tg=%s premium=%s queues=%s", tg, premium, queues)
@@ -206,6 +262,7 @@ class MatchmakingService:
             return None
 
         await self._publish_active(dialog_id, tg, candidate.telegram_id)
+        await self.remember_pair(tg, candidate.telegram_id)
         logger.info(
             "match_created dialog_id=%s u1=%s u2=%s premium=%s rating=%.2f",
             dialog_id, tg, candidate.telegram_id, premium, candidate.rating,
@@ -244,6 +301,7 @@ class MatchmakingService:
         queues: list[str],
         premium: bool,
         mode: str = "chat",
+        profile: _Profile | None = None,
     ) -> _Candidate | None:
         """Pick a partner with ~3 round-trips per batch instead of ~3 per candidate.
 
@@ -262,6 +320,7 @@ class MatchmakingService:
 
         try:
             last_partner = await self._last_partner(me)
+            recent, hidden = await self._exclusions(me)
             batch_size = max(int(PREMIUM_PROBE), 4) if premium else 4
             attempts = 0
 
@@ -271,6 +330,10 @@ class MatchmakingService:
                 fresh: list[_Candidate] = []
                 for raw in raws:
                     if raw.telegram_id in checked or raw.telegram_id in {me, last_partner}:
+                        skipped.append(raw)
+                        continue
+                    # Same stranger again, or somebody this user reported: not a match.
+                    if raw.telegram_id in recent or raw.telegram_id in hidden:
                         skipped.append(raw)
                         continue
                     checked.add(raw.telegram_id)
@@ -311,6 +374,21 @@ class MatchmakingService:
                     if candidate_seek != my_gender:
                         skipped.append(cand)
                         continue
+
+                    # Filters work both ways: mine must accept them, theirs must
+                    # accept me. Otherwise Premium would be a one-sided "show me
+                    # only 20-year-olds" switch.
+                    if profile is not None:
+                        if not profile.filters.fits(
+                            age=row.age, my_city=profile.city, their_city=row.city
+                        ):
+                            skipped.append(cand)
+                            continue
+                        if row.premium and not row.filters.fits(
+                            age=profile.age, my_city=row.city, their_city=profile.city
+                        ):
+                            skipped.append(cand)
+                            continue
 
                     if redis_busy or row.db_id in busy:
                         await self._release(cand)
@@ -399,6 +477,12 @@ class MatchmakingService:
                     User.season_rating_appearance,
                     User.appearance_ratings_count,
                     User.gender,
+                    User.birth_date,
+                    User.city,
+                    User.subscription_until,
+                    User.filter_age_min,
+                    User.filter_age_max,
+                    User.filter_city_only,
                 ).where(User.telegram_id.in_([int(i) for i in ids]))
             )
             rows = res.all()
@@ -406,8 +490,15 @@ class MatchmakingService:
             logger.exception("candidates_load_failed")
             return {}
 
+        now = datetime.now(tz=UTC)
         out: dict[int, MatchmakingService._Row] = {}
         for row in rows:
+            until = row[11]
+            if until is not None:
+                aware = until if until.tzinfo else until.replace(tzinfo=UTC)
+                premium = aware > now
+            else:
+                premium = False
             out[int(row[1])] = self._Row(
                 db_id=int(row[0]),
                 is_banned=bool(row[2]),
@@ -417,6 +508,16 @@ class MatchmakingService:
                 appearance=float(row[6] or 0.0),
                 appearance_count=int(row[7] or 0),
                 gender=str(getattr(row[8], "value", row[8]) or "male"),
+                age=age_from(row[9]),
+                city=(str(row[10]) if row[10] else None),
+                premium=premium,
+                filters=MatchFilters(
+                    age_min=int(row[12] or DEFAULT_AGE_MIN),
+                    age_max=int(row[13] or DEFAULT_AGE_MAX),
+                    city_only=bool(row[14]),
+                )
+                if premium
+                else MatchFilters(),
             )
         return out
 
@@ -478,6 +579,53 @@ class MatchmakingService:
             except Exception:
                 logger.warning("requeue_failed tg=%s", cand.telegram_id, exc_info=True)
 
+    async def _exclusions(self, me: int) -> tuple[set[int], set[int]]:
+        """Recent partners + reported pairs, one round-trip."""
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            pipe.lrange(keys.recent_partners_key(me), 0, RECENT_PARTNERS_MAX - 1)
+            pipe.smembers(keys.no_match_key(me))
+            recent_raw, hidden_raw = await pipe.execute()
+        except Exception:
+            logger.warning("exclusions_failed tg=%s", me, exc_info=True)
+            return set(), set()
+
+        def to_int(values) -> set[int]:
+            out: set[int] = set()
+            for value in values or []:
+                try:
+                    out.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        return to_int(recent_raw), to_int(hidden_raw)
+
+    async def remember_pair(self, first_tg: int, second_tg: int) -> None:
+        """Both sides remember the other, so the queue does not loop the same pair."""
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            for me, other in ((first_tg, second_tg), (second_tg, first_tg)):
+                key = keys.recent_partners_key(int(me))
+                pipe.lpush(key, str(int(other)))
+                pipe.ltrim(key, 0, RECENT_PARTNERS_MAX - 1)
+                pipe.expire(key, RECENT_TTL_S)
+            await pipe.execute()
+        except Exception:
+            logger.warning("remember_pair_failed a=%s b=%s", first_tg, second_tg, exc_info=True)
+
+    async def block_pair(self, first_tg: int, second_tg: int) -> None:
+        """Called after a complaint: these two never meet again."""
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            pipe.sadd(keys.no_match_key(int(first_tg)), str(int(second_tg)))
+            pipe.expire(keys.no_match_key(int(first_tg)), NO_MATCH_TTL_S)
+            pipe.sadd(keys.no_match_key(int(second_tg)), str(int(first_tg)))
+            pipe.expire(keys.no_match_key(int(second_tg)), NO_MATCH_TTL_S)
+            await pipe.execute()
+        except Exception:
+            logger.warning("block_pair_failed a=%s b=%s", first_tg, second_tg, exc_info=True)
+
     async def _last_partner(self, me: int) -> int | None:
         try:
             raw = _as_str(await self._redis.get(keys.last_partner(me)))
@@ -498,6 +646,10 @@ class MatchmakingService:
         appearance: float = 0.0
         appearance_count: int = 0
         gender: str = "male"
+        age: int = DEFAULT_AGE_MIN
+        city: str | None = None
+        premium: bool = False
+        filters: MatchFilters = MatchFilters()
 
     async def _create_dialog(self, session: AsyncSession, user: User, cand: _Candidate) -> int | None:
         try:

@@ -18,8 +18,10 @@ from app.handlers.commands import get_user
 from app.keyboards.rating import complaint_prompt_kb, rating_kb
 from app.redis import keys
 from app.services.complaint import ComplaintService
+from app.services.matchmaking import MatchmakingService
 from app.services.rating import RatingService
 from app.telegram_safe import safe_answer_callback
+from app.texts import COMPLAINT_PROMPT
 from app.ui import edit_ui
 from app.utils.ratelimit import rate_limit
 
@@ -274,14 +276,7 @@ async def complaint_start(
         return
 
     await state.set_state(Complaint.reason)
-    await edit_ui(
-        call.bot, redis, tg_id,
-        "<b>🚨 Жалоба</b>\n\n"
-        "Опишите, что произошло, одним сообщением. Модератор увидит переписку этого диалога.\n\n"
-        "<i>Запрещены: оскорбления, угрозы, спам, интимные фото без согласия, "
-        "материалы с несовершеннолетними.</i>",
-        kb=complaint_prompt_kb(),
-    )
+    await edit_ui(call.bot, redis, tg_id, COMPLAINT_PROMPT, kb=complaint_prompt_kb())
     await safe_answer_callback(call)
 
 
@@ -328,6 +323,9 @@ async def complaint_reason(
     )
     if created is not None:
         await ComplaintService().notify_moderators(message.bot, redis, settings, created, reason)
+        # These two never meet again: a complaint is also a "do not disturb" signal.
+        if created.accused_tg:
+            await MatchmakingService(redis, settings).block_pair(tg_id, int(created.accused_tg))
 
     await _clear_pending(redis, tg_id)
     await edit_ui(

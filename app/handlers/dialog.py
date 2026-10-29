@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -14,8 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import Dialog, User
-from app.keyboards.dialog_reply import NEXT, STOP
-from app.keyboards.rating import rating_kb
+from app.flows.states import Complaint
+from app.keyboards.dialog_reply import NEXT, REPORT, STOP
+from app.keyboards.rating import complaint_prompt_kb, rating_kb
 from app.redis import keys
 from app.services.dialog import DialogInfo, DialogService
 from app.services.vision import FaceDetector
@@ -25,6 +27,7 @@ from app.telegram_safe import (
     safe_delete_message,
     safe_send_message,
 )
+from app.texts import COMPLAINT_PROMPT
 from app.ui import clear_ui_message_id, edit_ui, get_ui_message_id, set_ui_message_id
 from app.utils.ratelimit import hit, rate_limit
 
@@ -163,6 +166,37 @@ async def finish_by_button(message: Message, session: AsyncSession, redis: Redis
         return
 
     await finish_dialog(message.bot, session, redis, settings, dialog_id, tg_id, action=action)
+
+
+@router.message(F.text == REPORT)
+async def report_button(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    redis: Redis,
+    settings: Settings,
+) -> None:
+    """One tap to report while the dialog is still open.
+
+    Safety beats neatness: a person being harassed should not have to finish the
+    dialog, wait for the rating screen and only then find the complaint button.
+    """
+    if message.from_user is None:
+        raise SkipHandler
+
+    tg_id = int(message.from_user.id)
+    dialog_id = await DialogService(redis, settings).active_dialog_id(session, tg_id)
+    await _delete(message)
+
+    if not dialog_id:
+        await _notice(message.bot, redis, tg_id, "Жалоба доступна во время диалога.")
+        return
+    if not await rate_limit(redis, key=keys.rate(f"report:{tg_id}"), ttl_s=5):
+        return
+
+    await finish_dialog(message.bot, session, redis, settings, dialog_id, tg_id, action="end")
+    await state.set_state(Complaint.reason)
+    await edit_ui(message.bot, redis, tg_id, COMPLAINT_PROMPT, kb=complaint_prompt_kb())
 
 
 @router.callback_query(F.data == "dialog:next")

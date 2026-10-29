@@ -40,6 +40,7 @@ def partner_card(partner: User) -> str:
             ("💎 Premium" if premium_active(partner) else ""),
             "",
             "<i>Собеседник не видит ваш профиль. Правила: без оскорблений и личных данных.</i>",
+            "<i>💡 Начните с «привет 👋» — на него отвечают чаще всего.</i>",
         ]
     ).replace("\n\n\n", "\n\n")
 
@@ -93,6 +94,10 @@ async def announce_match(
     if blocked:
         # Never leave the other side staring at a dialog with nobody on the line.
         await _abort_match(bot, redis, session, settings, dialog_id, blocked, delivered)
+
+    from app.services.activity import bump
+
+    await bump(redis, "match")
 
     logger.info(
         "match_announced dialog_id=%s a=%s b=%s blocked=%s", dialog_id, first_tg, second_tg, blocked
