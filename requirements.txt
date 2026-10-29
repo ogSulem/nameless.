@@ -1,16 +1,24 @@
-aiogram>=3.0.0
-sqlalchemy[asyncio]
-asyncpg
-alembic
-pydantic-settings
-redis
-aiohttp
-openai
-huggingface_hub
-python-dotenv==1.0.1
-pydantic==2.9.2
-orjson==3.10.12
-opencv-python-headless
-numpy
-mediapipe==0.10.14
+# Runtime dependencies.
+#
+# Rules learned the hard way in this repo:
+#  * OpenCV must be pinned to 4.x. Unpinned, pip resolves opencv-python-headless 5.x,
+#    which has no `cv2.CascadeClassifier` → `import app.main` dies in a fresh image.
+#  * OpenCV 4.10 wheels are built against numpy 1.x, so numpy must stay <2.
+#  * aiogram 3.15 pins pydantic <2.10; the bot is tested on aiogram 3.31.
+# CI installs this file, imports app.main and builds the Docker image.
 
+aiogram==3.31.0
+aiohttp>=3.10,<4
+SQLAlchemy[asyncio]>=2.0.36,<2.1
+asyncpg>=0.29,<1
+alembic>=1.13,<2
+pydantic>=2.9,<3
+pydantic-settings>=2.5,<3
+redis>=5.0,<9
+orjson>=3.10,<4
+python-dotenv>=1.0,<2
+
+# Vision (best-effort face check). Single backend on purpose: no mediapipe /
+# huggingface — they drag a second, conflicting OpenCV build and ~800 MB of deps.
+opencv-python-headless==4.10.0.84
+numpy==1.26.4

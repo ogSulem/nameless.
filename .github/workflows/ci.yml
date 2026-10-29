@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ruff==0.8.6
+      - name: Ruff
+        run: ruff check app tests scripts
+      - name: Compile all
+        run: python -m compileall -q app
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      # Catches the "OpenCV 5 has no CascadeClassifier" class of breakage before deploy.
+      - name: Import smoke test
+        env:
+          BOT_TOKEN: 000000000:CI-TOKEN
+          ADMINS: "1"
+        run: python -c "import app.main; from app.handlers.router import build_router; build_router()"
+      - name: Pytest
+        env:
+          BOT_TOKEN: 000000000:CI-TOKEN
+          ADMINS: "1"
+        run: pytest -q
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: nameless
+          POSTGRES_USER: nameless
+          POSTGRES_PASSWORD: nameless
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U nameless"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Upgrade head
+        env:
+          BOT_TOKEN: 000000000:CI-TOKEN
+          ADMINS: "1"
+          DATABASE_URL: postgresql+asyncpg://nameless:nameless@localhost:5432/nameless
+        run: alembic upgrade head
+      - name: Downgrade one step and re-upgrade
+        env:
+          BOT_TOKEN: 000000000:CI-TOKEN
+          ADMINS: "1"
+          DATABASE_URL: postgresql+asyncpg://nameless:nameless@localhost:5432/nameless
+        run: alembic downgrade -1 && alembic upgrade head
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: nameless-bot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Image imports cleanly (no OpenCV surprises)
+        run: docker run --rm --entrypoint python -e BOT_TOKEN=000000000:CI -e ADMINS=1 nameless-bot:ci -c "import app.main; print('ok')"

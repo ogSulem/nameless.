@@ -4,7 +4,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -16,19 +16,19 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-
 target_metadata = Base.metadata
+
+# Arbitrary but fixed: two replicas starting at once must not migrate concurrently.
+ADVISORY_LOCK_ID = 8_247_112_001
 
 
 def get_url() -> str:
-    settings = Settings()
-    return settings.database_dsn
+    return Settings().database_dsn
 
 
 def run_migrations_offline() -> None:
-    url = get_url()
     context.configure(
-        url=url,
+        url=get_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -48,7 +48,9 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_migrations_online() -> None:
     configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_url()
+    url = get_url()
+    configuration["sqlalchemy.url"] = url
+    is_postgres = url.startswith("postgresql")
 
     connectable = async_engine_from_config(
         configuration,
@@ -57,7 +59,18 @@ async def run_migrations_online() -> None:
     )
 
     async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+        if is_postgres:
+            # Serialise concurrent deploys; released automatically with the session.
+            await connection.execute(text("SELECT pg_advisory_lock(:id)"), {"id": ADVISORY_LOCK_ID})
+        try:
+            await connection.run_sync(do_run_migrations)
+            await connection.commit()
+        finally:
+            if is_postgres:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:id)"), {"id": ADVISORY_LOCK_ID}
+                )
+                await connection.commit()
 
     await connectable.dispose()
 

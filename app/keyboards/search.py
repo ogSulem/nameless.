@@ -3,13 +3,13 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def search_kb() -> InlineKeyboardMarkup:
+def searching_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔎 Поиск", callback_data="search")]]
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отменить поиск", callback_data="search:cancel")]]
     )
 
 
-def cancel_search_kb() -> InlineKeyboardMarkup:
+def match_card_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_search")]]
+        inline_keyboard=[[InlineKeyboardButton(text="⏭️ Следующий", callback_data="dialog:next")]]
     )

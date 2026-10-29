@@ -1,7 +1,6 @@
 import logging
 import os
 import re
-from datetime import date
 from logging import Logger
 from logging.handlers import TimedRotatingFileHandler
 
@@ -18,11 +17,11 @@ class SecretMaskingFilter(logging.Filter):
         for s in self._secrets:
             if s in msg:
                 msg = msg.replace(s, "*" * 8)
-        
+
         # Also mask common patterns like bot tokens or passwords in DSNs
         msg = re.sub(r"([0-9]{8,12}:[a-zA-Z0-9_-]{20,})", "TOKEN_MASKED", msg)
         msg = re.sub(r":([^@/]+)@([^/]+):(\d+)", r":***@\2:\3", msg) # DSN password
-        
+
         record.msg = msg
         return True
 

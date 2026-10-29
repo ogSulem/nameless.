@@ -1,13 +1,13 @@
 import argparse
 import asyncio
-import os
 from datetime import datetime
 
 from dotenv import load_dotenv
 from sqlalchemy import select
 
 from app.config import Settings
-from app.database.models import Dialog, Message as DbMessage, User
+from app.database.models import Dialog, User
+from app.database.models import Message as DbMessage
 from app.database.session import create_engine, create_sessionmaker
 
 

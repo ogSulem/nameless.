@@ -2,19 +2,9 @@ from __future__ import annotations
 
 import re
 
-def normalize_city_name(name: str) -> str:
-    if not name:
-        return ""
-    # Capitalize each part of the city name (e.g., "санкт-петербург" -> "Санкт-Петербург", "санкт петербург" -> "Санкт Петербург")
-    parts = re.split(r'([ \-])', name.lower())
-    normalized_parts = [p.capitalize() if p not in (' ', '-') else p for p in parts]
-    return "".join(normalized_parts)
+MAX_CITY_LEN = 40
+_CITY_RE = re.compile(r"^[А-Яа-яЁёA-Za-z][А-Яа-яЁёA-Za-z \-']{1,39}$")
 
-def _canonical_name(name: str) -> str:
-    # Remove all non-alphanumeric characters and lowercase for comparison
-    return re.sub(r'[^a-zа-я0-9]', '', name.lower())
-
-# Hardcoded list of major CIS/Russian cities for basic validation
 COMMON_CITIES_LIST = [
     "Москва", "Санкт-Петербург", "Новосибирск", "Екатеринбург", "Казань", "Нижний Новгород",
     "Челябинск", "Красноярск", "Самара", "Уфа", "Ростов-на-Дону", "Омск", "Краснодар",
@@ -34,21 +24,43 @@ COMMON_CITIES_LIST = [
     "Рыбинск", "Северодвинск", "Петропавловск-Камчатский", "Красногорск", "Уссурийск",
     "Волгодонск", "Новочеркасск", "Сызрань", "Каменск-Уральский", "Златоуст", "Альметьевск",
     "Электросталь", "Керчь", "Миасс", "Салават", "Хасавюрт", "Пятигорск", "Копейск",
-    "Коломна", "Майкоп", "Одинцово", "Ковров", "Железнодорожный", "Нефтеюганск",
+    "Коломна", "Майкоп", "Одинцово", "Ковров", "Нефтеюганск",
     "Минск", "Гомель", "Могилев", "Витебск", "Гродно", "Брест", "Астана", "Алматы",
     "Шымкент", "Караганда", "Актобе", "Тараз", "Павлодар", "Усть-Каменогорск",
-    "Семей", "Кызылорда", "Костанай", "Атырау", "Орал", "Петропавловск", "Бишкек",
+    "Семей", "Кызылорда", "Костанай", "Атырау", "Петропавловск", "Бишкек",
     "Ош", "Ташкент", "Наманган", "Самарканд", "Андижан", "Нукус", "Бухара", "Карши",
     "Фергана", "Коканд", "Маргилан", "Душанбе", "Худжанд", "Ереван", "Гюмри", "Ванадзор",
-    "Баку", "Гянджа", "Сумгаит", "Тбилиси", "Кутаиси", "Батуми"
+    "Баку", "Гянджа", "Сумгаит", "Тбилиси", "Кутаиси", "Батуми",
 ]
 
-CANONICAL_CITIES = { _canonical_name(city): city for city in COMMON_CITIES_LIST }
 
-def is_valid_city(city: str) -> bool:
-    return _canonical_name(city) in CANONICAL_CITIES
+def _canonical(name: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]", "", name.lower())
 
-def get_canonical_city_name(city: str) -> str:
-    # Returns the properly formatted name from our database
-    return CANONICAL_CITIES.get(_canonical_name(city), normalize_city_name(city))
 
+CANONICAL_CITIES = {_canonical(city): city for city in COMMON_CITIES_LIST}
+
+
+def normalize_city_name(name: str) -> str:
+    """`санкт петербург` → `Санкт-Петербург`, `нижний новгород` → `Нижний Новгород`."""
+    parts = re.split(r"([ \-])", name.strip().lower())
+    return "".join(p if p in {" ", "-"} else p.capitalize() for p in parts)
+
+
+def sanitize_city(raw: str) -> str | None:
+    """Accept any plausible city name (not only the built-in list).
+
+    The previous version rejected anyone from a town that was missing from the
+    hardcoded list — an avoidable churn source for a city-based matching product.
+    """
+    value = (raw or "").strip()
+    if not value or len(value) > MAX_CITY_LEN or not _CITY_RE.match(value):
+        return None
+    key = _canonical(value)
+    if key in CANONICAL_CITIES:
+        return CANONICAL_CITIES[key]
+    return normalize_city_name(value)
+
+
+def is_known_city(city: str) -> bool:
+    return _canonical(city) in CANONICAL_CITIES

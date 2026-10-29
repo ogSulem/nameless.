@@ -1,55 +1,87 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
+import sys
 import warnings
 
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
+from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.types import BotCommand
+from aiohttp import web
+from redis.asyncio import Redis
+from sqlalchemy import select, text
 
 from app.config import Settings
+from app.database.models import Payment
 from app.database.session import create_engine, create_sessionmaker
 from app.handlers.router import build_router
-from app.health_server import start_health_server, stop_health_server
+from app.health_server import HealthServer, start_health_server, stop_health_server
 from app.logging.setup import setup_logging
-from app.middlewares.logging import LoggingMiddleware
-from app.middlewares.app_context import AppContextMiddleware
-from app.middlewares.callback_dedupe import CallbackDedupeMiddleware
-from app.middlewares.message_dedupe import MessageDedupeMiddleware
-from app.middlewares.db_session import DbSessionMiddleware
-from app.middlewares.error_boundary import ErrorBoundaryMiddleware
 from app.metrics import log_snapshot_and_reset
+from app.middlewares.app_context import AppContextMiddleware, set_settings
+from app.middlewares.db_session import DbSessionMiddleware
+from app.middlewares.dedupe import DedupeMiddleware
+from app.middlewares.error_boundary import ErrorBoundaryMiddleware
+from app.middlewares.gates import BanGateMiddleware
+from app.middlewares.logging import LoggingMiddleware
+from app.middlewares.presence import PresenceMiddleware
+from app.redis import keys
 from app.redis.client import create_redis
-
+from app.services import admin as admin_service
+from app.services.dialog import DialogService
+from app.services.matchmaking import MatchmakingService
+from app.services.payments import PaymentService
 
 logger = logging.getLogger(__name__)
 
+LOCK_KEY = "lock:singleton:bot"
+LOCK_TTL_S = 30
+SWEEP_INTERVAL_S = 300
+RETENTION_INTERVAL_S = 3600
 
-async def _close_bot(bot: Bot | None) -> None:
-    if bot is None:
-        return
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
+COMMANDS = [
+    BotCommand(command="start", description="Профиль и поиск собеседника"),
+    BotCommand(command="stop", description="Завершить поиск или диалог"),
+    BotCommand(command="premium", description="Подписка Premium"),
+    BotCommand(command="help", description="Как всё работает"),
+    BotCommand(command="privacy", description="Политика обработки данных"),
+    BotCommand(command="terms", description="Условия использования"),
+    BotCommand(command="delete_me", description="Удалить профиль и данные"),
+]
 
 
-async def _acquire_singleton_lock(redis) -> tuple[bool, str]:
-    key = "lock:singleton:bot"
+# ------------------------------------------------------------------- singleton
+async def acquire_lock(redis: Redis) -> str | None:
     value = secrets.token_hex(16)
     try:
-        ok = await redis.set(key, value, nx=True, ex=30)
-        return (bool(ok), value)
+        if await redis.set(LOCK_KEY, value, nx=True, ex=LOCK_TTL_S):
+            return value
     except Exception:
-        # If Redis is down, we can't guarantee singleton; keep running.
-        return (True, value)
+        logger.warning("singleton_lock_unavailable", exc_info=True)
+        return value  # Redis down: don't block startup, polling will conflict anyway
+    return None
 
 
-async def _refresh_singleton_lock(redis, value: str) -> None:
-    key = "lock:singleton:bot"
-    # Extend TTL only if we still own the lock.
+async def release_lock(redis: Redis, value: str | None) -> None:
+    if not value:
+        return
+    lua = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('del', KEYS[1])
+    end
+    return 0
+    """
+    try:
+        await redis.eval(lua, 1, LOCK_KEY, value)
+    except Exception:
+        logger.debug("release_lock_failed", exc_info=True)
+
+
+async def refresh_lock(redis: Redis, value: str) -> None:
     lua = """
     if redis.call('get', KEYS[1]) == ARGV[1] then
       return redis.call('expire', KEYS[1], ARGV[2])
@@ -58,180 +90,249 @@ async def _refresh_singleton_lock(redis, value: str) -> None:
     """
     while True:
         try:
-            await asyncio.sleep(10)
-            await redis.eval(lua, 1, key, value, "30")
+            await asyncio.sleep(LOCK_TTL_S / 3)
+            await redis.eval(lua, 1, LOCK_KEY, value, str(LOCK_TTL_S))
         except asyncio.CancelledError:
-            break
+            return
         except Exception:
-            logger.exception("singleton_lock_refresh_failed")
+            logger.warning("lock_refresh_failed", exc_info=True)
 
 
-async def _release_singleton_lock(redis, value: str) -> None:
-    key = "lock:singleton:bot"
-    lua = """
-    if redis.call('get', KEYS[1]) == ARGV[1] then
-      return redis.call('del', KEYS[1])
-    end
-    return 0
-    """
-    try:
-        await redis.eval(lua, 1, key, value)
-    except Exception:
-        pass
+# -------------------------------------------------------------------- jobs
+async def sweeper_loop(settings: Settings, redis: Redis, session_factory) -> None:
+    """Close abandoned dialogs and enforce retention — the privacy policy promise."""
+    last_retention = 0.0
+    while True:
+        try:
+            await asyncio.sleep(SWEEP_INTERVAL_S)
+            async with session_factory() as session:
+                service = DialogService(redis, settings)
+                closed = await service.sweep(session)
+                for _dialog_id, telegram_ids in closed:
+                    for tg in telegram_ids:
+                        try:
+                            await redis.delete(keys.active_dialog(tg), keys.online_key(tg))
+                        except Exception:
+                            pass
+
+            now = asyncio.get_running_loop().time()
+            if now - last_retention >= RETENTION_INTERVAL_S:
+                last_retention = now
+                async with session_factory() as session:
+                    report = await admin_service.run_maintenance(session, settings)
+                if report.deleted_messages or report.deleted_photos:
+                    logger.info(
+                        "retention_applied messages=%s photos=%s complaints=%s",
+                        report.deleted_messages, report.deleted_photos, report.deleted_complaints,
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("sweeper_loop_failed")
 
 
-async def _close_redis(redis) -> None:
-    if redis is None:
-        return
-    try:
-        # Use aclose() for newer redis-py versions to avoid DeprecationWarning
-        if hasattr(redis, "aclose"):
-            await redis.aclose()
-        else:
-            await redis.close()
-    except Exception:
-        pass
-    try:
-        await redis.connection_pool.disconnect(inuse_connections=True)
-    except Exception:
-        pass
+async def metrics_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await log_snapshot_and_reset()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("metrics_loop_failed")
 
 
-async def main() -> None:
+# ---------------------------------------------------------------------- main
+async def run() -> int:
     settings = Settings()
     setup_logging(settings.log_level)
-
-    health_server = None
-    try:
-        health_server = await start_health_server(host="0.0.0.0", port=int(settings.port))
-    except Exception:
-        logger.exception("health_server_start_failed port=%s", getattr(settings, "port", None))
-
-    redis = create_redis(
-        settings.redis_host, 
-        settings.redis_port, 
-        settings.redis_db, 
-        settings.redis_username,
-        settings.redis_password,
-        settings.redis_url
+    set_settings(settings)
+    logger.info(
+        "bot_start admins=%s moderators=%s support=%s payments=%s vision=%s",
+        len(settings.admin_ids), len(settings.moderator_ids), len(settings.support_ids),
+        settings.payments_enabled, settings.vision_enabled,
     )
 
+    redis = create_redis(
+        settings.redis_host,
+        settings.redis_port,
+        settings.redis_db,
+        settings.redis_username,
+        settings.redis_password,
+        settings.redis_url,
+    )
     engine = create_engine(settings.database_dsn)
     session_factory = create_sessionmaker(engine)
 
-    bot = Bot(token=settings.bot_token)
-    
-    # Ensure RedisStorage uses the same redis client with authentication
+    lock_value = await acquire_lock(redis)
+    if lock_value is None:
+        logger.error("singleton_lock_busy: another instance is polling. Exiting with code 1 so the "
+                     "platform can restart/route correctly.")
+        await engine.dispose()
+        await _close_redis(redis)
+        return 1
+
+    async def check_db() -> None:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+    async def check_redis() -> None:
+        await redis.ping()
+
+    bot = Bot(token=settings.bot_token, parse_mode=None)
+    routes = _webhook_routes(settings, redis, session_factory, bot)
+
+    health: HealthServer | None = None
+    try:
+        health = await start_health_server(
+            host="0.0.0.0",
+            port=int(settings.port),
+            check_db=check_db,
+            check_redis=check_redis,
+            routes=routes,
+        )
+    except Exception:
+        logger.exception("health_server_start_failed port=%s", settings.port)
+
     storage = RedisStorage(redis=redis)
     dp = Dispatcher(storage=storage)
 
-    dp.include_router(build_router())
-
     dp.update.middleware(LoggingMiddleware())
     dp.update.middleware(AppContextMiddleware(settings=settings, redis=redis))
-    dp.update.middleware(CallbackDedupeMiddleware(redis=redis))
-    dp.update.middleware(MessageDedupeMiddleware(redis=redis))
+    dp.update.middleware(DedupeMiddleware(redis=redis))
+    dp.update.middleware(PresenceMiddleware(redis, settings, session_factory))
     dp.update.middleware(ErrorBoundaryMiddleware(settings=settings, redis=redis))
     dp.update.middleware(DbSessionMiddleware(session_factory))
+    dp.update.middleware(BanGateMiddleware(settings, session_factory))
+    dp.include_router(build_router())
 
-    logger.info("bot_start")
-
-    lock_value = ""
-    lock_refresh_task: asyncio.Task | None = None
-    got_lock, lock_value = await _acquire_singleton_lock(redis)
-    if not got_lock:
-        logger.error("singleton_lock_not_acquired: another instance is running")
-        try:
-            await stop_health_server(health_server)
-        except Exception:
-            pass
-        await _close_bot(bot)
-        await _close_redis(redis)
-        try:
-            await engine.dispose()
-        except Exception:
-            pass
-        return
+    tasks = [
+        asyncio.create_task(refresh_lock(redis, lock_value)),
+        asyncio.create_task(metrics_loop()),
+        asyncio.create_task(sweeper_loop(settings, redis, session_factory)),
+    ]
 
     try:
-        lock_refresh_task = asyncio.create_task(_refresh_singleton_lock(redis, lock_value))
+        await bot.set_my_commands(COMMANDS)
     except Exception:
-        lock_refresh_task = None
+        logger.warning("set_my_commands_failed", exc_info=True)
 
-    async def _metrics_loop() -> None:
-        while True:
-            try:
-                await asyncio.sleep(60)
-                await log_snapshot_and_reset()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("metrics_loop_failed")
-
-    metrics_task = asyncio.create_task(_metrics_loop())
-
-    bot: Bot | None = Bot(token=settings.bot_token)
-    delay_s = 1
+    backoff = 1
     try:
         while True:
             try:
-                await dp.start_polling(bot)
+                await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
                 logger.info("polling_stopped")
-                delay_s = 1
-                break
+                return 0
             except asyncio.CancelledError:
                 logger.info("polling_cancelled")
-                break
-            except TelegramConflictError as e:
-                # Happens when multiple bot instances use long polling (getUpdates) at once.
-                # In production, you must ensure only one instance is running.
-                logger.exception("telegram_conflict_error: %s", e)
-                delay_s = max(delay_s, 15)
-            except (TelegramNetworkError, ConnectionResetError) as e:
-                logger.exception("telegram_network_error: %s", e)
-            except Exception as e:
-                logger.exception("polling_crashed: %s", e)
+                return 0
+            except TelegramUnauthorizedError:
+                logger.error("bot_token_rejected: check BOT_TOKEN")
+                return 2
+            except TelegramConflictError:
+                logger.error("telegram_conflict: another instance is polling with the same token")
+                backoff = max(backoff, 15)
+            except (TelegramNetworkError, ConnectionResetError, TimeoutError):
+                logger.warning("telegram_network_error", exc_info=True)
+            except Exception:
+                logger.exception("polling_crashed")
 
-            await _close_bot(bot)
-            bot = None
-
-            await asyncio.sleep(delay_s)
-            delay_s = min(delay_s * 2, 60)
-            bot = Bot(token=settings.bot_token)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
     finally:
-        try:
-            metrics_task.cancel()
-            await metrics_task
-        except Exception:
-            pass
-
-        try:
-            if lock_refresh_task is not None:
-                lock_refresh_task.cancel()
-                await lock_refresh_task
-        except Exception:
-            pass
-
-        try:
-            if lock_value:
-                await _release_singleton_lock(redis, lock_value)
-        except Exception:
-            pass
-        await _close_bot(bot)
-        try:
+        for task in tasks:
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
+        with contextlib.suppress(Exception):
             await storage.close()
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            await bot.session.close()
+        await release_lock(redis, lock_value)
+        await stop_health_server(health)
         await _close_redis(redis)
+        await engine.dispose()
+        logger.info("bot_stopped")
+
+
+def _webhook_routes(settings: Settings, redis: Redis, session_factory, bot: Bot) -> list:
+    """ЮKassa notification endpoint.
+
+    The body is never trusted: we re-read the payment from ЮKassa and compare the
+    amount, then credit the subscription exactly once. That makes retries and
+    spoofed requests harmless.
+    """
+    if not (settings.yookassa_shop_id and settings.yookassa_secret_key):
+        return []
+
+    async def yookassa_webhook(request: web.Request) -> web.StreamResponse:
         try:
-            await engine.dispose()
+            body = await request.json()
         except Exception:
-            pass
-        await stop_health_server(health_server)
+            return web.Response(status=400, text="bad json")
+        if not isinstance(body, dict):
+            return web.Response(status=400, text="bad payload")
+
+        event = str(body.get("event") or "")
+        payment_id = str((body.get("object") or {}).get("id") or "")
+        if not payment_id:
+            return web.Response(status=200, text="ignored")
+        if event not in {"payment.succeeded", "payment.canceled", "payment.waiting_for_capture"}:
+            return web.Response(status=200, text="ignored")
+
+        try:
+            async with session_factory() as session:
+                service = PaymentService(settings, redis)
+                state, until = await service.apply_yookassa_notification(session, payment_id)
+                if state == "paid":
+                    tg_id = (
+                        await session.execute(
+                            select(Payment.telegram_id).where(Payment.external_id == payment_id)
+                        )
+                    ).scalar_one_or_none()
+                    if tg_id:
+                        await MatchmakingService(redis, settings).invalidate_premium(int(tg_id))
+                    await notify_payment_success(bot, settings, payment_id, until)
+        except Exception:
+            logger.exception("yookassa_webhook_failed id=%s", payment_id)
+            # 200 so ЮKassa does not hammer us; the payment is re-checked on the next poll.
+            return web.Response(status=200, text="error logged")
+        return web.Response(status=200, text="ok")
+
+    return [("POST", "/yookassa/webhook", yookassa_webhook)]
+
+
+async def notify_payment_success(bot: Bot, settings: Settings, payment_id: str, until) -> None:
+    if not settings.alerts_chat_id or until is None:
+        return
+    try:
+        await bot.send_message(
+            int(settings.alerts_chat_id),
+            f"💰 <b>Оплата Premium</b>\n<code>{payment_id}</code> · до {until:%d.%m.%Y}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.warning("payment_alert_failed", exc_info=True)
+
+
+async def _close_redis(redis: Redis) -> None:
+    try:
+        if hasattr(redis, "aclose"):
+            await redis.aclose()
+        else:  # pragma: no cover - older redis-py
+            await redis.close()
+    except Exception:
+        logger.debug("redis_close_failed", exc_info=True)
+
+
+def main() -> None:
+    warnings.filterwarnings("ignore", message=".*protected namespace.*")
+    try:
+        sys.exit(asyncio.run(run()))
+    except KeyboardInterrupt:  # pragma: no cover
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    # Silencing Pydantic V2 warnings from aiogram about "model_" protected namespace
-    warnings.filterwarnings("ignore", message='Field "model_custom_emoji_id" in UniqueGiftColors has conflict with protected namespace "model_".')
-    
-    asyncio.run(main())
+    main()

@@ -1,45 +1,57 @@
 from __future__ import annotations
 
-MATCH_RESERVE_LUA = r"""
--- KEYS are unused (script uses ARGV only)
--- ARGV:
--- 1: me_tg_id
--- 2: lock_ttl_ms
--- 3..N: queue names
-
+# Atomically pick and reserve one candidate from one or more ZSET queues.
+#
+# ARGV[1] = me (telegram id)
+# ARGV[2] = now (epoch seconds, passed by the client: TIME is not allowed in
+#            a script that also performs writes)
+# ARGV[3] = lock ttl in milliseconds
+# ARGV[4] = max candidates to probe
+# ARGV[5..] = queue keys (in priority order)
+#
+# Returns {candidate_tg, queue_key, score} or {} when nothing is available.
+RESERVE_LUA = r"""
 local me = ARGV[1]
-local ttl = tonumber(ARGV[2])
+local now = tonumber(ARGV[2]) or 0
+local ttl = tonumber(ARGV[3]) or 4000
+local probe = tonumber(ARGV[4]) or 25
 
-local function lock_key(uid)
-  return "lock:match:" .. uid
-end
-
-local function active_key(uid)
-  return "active_dialog:" .. uid
-end
-
-if redis.call("GET", active_key(me)) then
-  return {"ACTIVE"}
-end
-
-for i = 3, #ARGV do
+for i = 5, #ARGV do
   local q = ARGV[i]
-
-  local candidate = redis.call("RPOP", q)
-  if candidate then
-    if candidate == me then
-      redis.call("LPUSH", q, candidate)
-    elseif redis.call("GET", active_key(candidate)) then
-      redis.call("LPUSH", q, candidate)
+  local items = redis.call("ZRANGEBYSCORE", q, "-inf", now, "LIMIT", 0, probe)
+  for _, cand in ipairs(items) do
+    if cand == me then
+      -- never match with self, but keep the entry in the queue
+    elseif redis.call("EXISTS", "lock:match:" .. cand) == 1 then
+      -- someone else is reserving this candidate right now
+    elseif redis.call("EXISTS", "active_dialog:" .. cand) == 1 then
+      redis.call("ZREM", q, cand)
     else
-      if redis.call("SET", lock_key(candidate), "1", "NX", "PX", ttl) then
-        return {"OK", candidate, q}
-      else
-        redis.call("LPUSH", q, candidate)
-      end
+      local score = redis.call("ZSCORE", q, cand)
+      redis.call("ZREM", q, cand)
+      redis.call("SET", "lock:match:" .. cand, me, "PX", ttl)
+      return {cand, q, score or tostring(now)}
     end
   end
 end
 
-return {"NONE"}
+return {}
+"""
+
+# Transactional claim of a reserved candidate: only succeeds for the reserving user.
+# ARGV[1]=me ARGV[2]=candidate ARGV[3]=ttl_ms
+CLAIM_LUA = r"""
+if redis.call("GET", "lock:match:" .. ARGV[2]) == ARGV[1] then
+  redis.call("SET", "lock:match:" .. ARGV[2], ARGV[1], "PX", ARGV[3])
+  return 1
+end
+return 0
+"""
+
+# Release my reservation, but only if I still own it.
+RELEASE_LUA = r"""
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
 """

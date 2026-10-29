@@ -1,184 +1,96 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery
 from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database.models import User
-from app.keyboards.dialog_reply import dialog_reply_kb
-from app.keyboards.search import cancel_search_kb
-from app.keyboards.search import search_kb
-from app.services.matchmaking import MatchmakingService
 from app.flows.profile import show_profile
+from app.handlers.commands import get_user
+from app.keyboards.search import searching_kb
 from app.redis import keys
-from app.ui import edit_ui, get_ui_message_id, send_new_ui
-from app.telegram_safe import safe_delete_message
+from app.services.dialog import DialogService
+from app.services.matchmaking import MatchmakingService
+from app.services.notifications import announce_match
+from app.telegram_safe import safe_answer_callback
+from app.ui import edit_ui, get_ui_message_id
 from app.utils.ratelimit import rate_limit
 
 logger = logging.getLogger(__name__)
 router = Router(name="search")
 
-
-def _search_message_key(tg_id: int) -> str:
-    return keys.ui_search_message_id(tg_id)
-
-
-async def _get_search_message_id(redis: Redis, tg_id: int) -> int | None:
-    v = await redis.get(_search_message_key(tg_id))
-    return int(v) if v else None
-
-
-async def _set_search_message_id(redis: Redis, tg_id: int, message_id: int) -> None:
-    await redis.set(_search_message_key(tg_id), str(message_id), ex=60 * 60 * 24 * 30)
+SEARCHING_TEXT = (
+    "🔎 <b>Ищу собеседника…</b>\n\n"
+    "Обычно это занимает несколько секунд. Если в очереди сейчас никого нет — "
+    "оставьте поиск включённым: как только появится подходящий человек, я сразу "
+    "пришлю карточку.\n\n"
+    "<i>Можно закрыть чат — поиск продолжится.</i>"
+)
 
 
-async def _clear_search_message_id(redis: Redis, tg_id: int) -> None:
-    await redis.delete(_search_message_key(tg_id))
-
-
-def _age(birth_date: date) -> int:
-    today = date.today()
-    years = today.year - birth_date.year
-    if (today.month, today.day) < (birth_date.month, birth_date.day):
-        years -= 1
-    return years
-
-
-def _gender_short(v: str) -> str:
-    return "М" if v == "male" else "Ж"
-
-
-@router.callback_query(F.data == "cancel_search")
-async def cancel_search(call: CallbackQuery, session: AsyncSession, redis: Redis) -> None:
-    if call.from_user is None:
-        await call.answer()
-        return
-
-    ok = await rate_limit(redis, key=f"rl:user:cancel_search:{call.from_user.id}", ttl_s=1)
-    if not ok:
-        await call.answer()
-        return
-    res = await session.execute(select(User).where(User.telegram_id == call.from_user.id))
-    user = res.scalar_one_or_none()
-    if user is not None:
-        svc = MatchmakingService(redis)
-        await svc.dequeue_from_all(user.telegram_id, user.city)
-
-    try:
-        await _clear_search_message_id(redis, call.from_user.id)
-    except Exception:
-        pass
-    await show_profile(call.bot, redis, session, call.from_user.id)
-    await call.answer()
-
-
-@router.callback_query(F.data == "search")
-async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
-    if call.from_user is None:
-        await call.answer()
-        return
-
-    ok = await rate_limit(redis, key=f"rl:user:search:{call.from_user.id}", ttl_s=2)
-    if not ok:
-        await call.answer()
-        return
-    res = await session.execute(select(User).where(User.telegram_id == call.from_user.id))
-    user = res.scalar_one_or_none()
+async def start_search_for(
+    bot: Bot,
+    session: AsyncSession,
+    redis: Redis,
+    settings: Settings,
+    tg_id: int,
+) -> bool:
+    """Run one matching attempt. Returns True when a partner was found."""
+    user = await get_user(session, tg_id)
     if user is None:
-        await send_new_ui(call.bot, redis, call.from_user.id, "Сначала пройди регистрацию через /start")
-        await call.answer()
-        return
-
+        await edit_ui(bot, redis, tg_id, "Профиль не найден. Нажмите /start.")
+        return False
     if user.is_banned:
-        await send_new_ui(call.bot, redis, call.from_user.id, "Твой аккаунт заблокирован.")
-        await call.answer()
-        # Invalidate cache if somehow it was True
-        try:
-            await redis.delete(keys.user_id_by_tg(call.from_user.id))
-        except Exception:
-            pass
-        return
+        await edit_ui(bot, redis, tg_id, "🚫 Аккаунт заблокирован.")
+        return False
 
-    svc = MatchmakingService(redis)
-    premium = await svc.is_user_premium(session, user.id)
-    result = await svc.try_match(session=session, user=user, premium=premium)
+    if await DialogService(redis, settings).active_dialog_id(session, tg_id):
+        return False
+
+    matchmaking = MatchmakingService(redis, settings)
+    premium = await matchmaking.is_premium(session, user)
+    result = await matchmaking.try_match(session=session, user=user, premium=premium)
 
     if result is None:
-        await edit_ui(call.bot, redis, call.from_user.id, "Ищу собеседника...", kb=cancel_search_kb())
-        mid = await get_ui_message_id(redis, call.from_user.id)
+        await edit_ui(bot, redis, tg_id, SEARCHING_TEXT, kb=searching_kb())
+        mid = await get_ui_message_id(redis, tg_id)
         if mid:
             try:
-                await _set_search_message_id(redis, call.from_user.id, mid)
+                await redis.set(keys.ui_search_message_id(tg_id), str(mid), ex=60 * 60 * 24)
             except Exception:
                 pass
-        await call.answer()
+        return False
+
+    await announce_match(bot, redis, session, settings, result.dialog_id, tg_id, result.partner_telegram_id)
+    return True
+
+
+@router.callback_query(F.data == "search:start")
+async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    tg_id = int(call.from_user.id)
+    if not await rate_limit(redis, key=keys.rate(f"search:{tg_id}"), ttl_s=2):
+        await safe_answer_callback(call, "Секунду…")
         return
 
-    # Instant match: remove the current UI (profile) so the chat stays single-message
-    current_ui_mid = await get_ui_message_id(redis, call.from_user.id)
-    if current_ui_mid:
-        await safe_delete_message(call.bot, call.from_user.id, current_ui_mid)
+    await safe_answer_callback(call)
+    await start_search_for(call.bot, session, redis, settings, tg_id)
 
-    res2 = await session.execute(select(User).where(User.telegram_id == result.partner_user_id))
-    partner = res2.scalar_one()
 
-    my_card = (
-        "Собеседник найден!\n"
-        f"Пол: {_gender_short(partner.gender.value)}\n"
-        f"Возраст: {_age(partner.birth_date)}\n"
-        f"Город: {partner.city or '-'}\n"
-        f"Рейтинг: {float(partner.season_rating_chat or 0.0):.1f}"
-    )
-    partner_card = (
-        "Собеседник найден!\n"
-        f"Пол: {_gender_short(user.gender.value)}\n"
-        f"Возраст: {_age(user.birth_date)}\n"
-        f"Город: {user.city or '-'}\n"
-        f"Рейтинг: {float(user.season_rating_chat or 0.0):.1f}"
-    )
+@router.callback_query(F.data == "search:cancel")
+async def search_cancel(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    tg_id = int(call.from_user.id)
+    if not await rate_limit(redis, key=keys.rate(f"search:cancel:{tg_id}"), ttl_s=1):
+        await safe_answer_callback(call)
+        return
 
-    # 1. Replace searching UI with a new card message that has reply controls
-    mid = await _get_search_message_id(redis, user.telegram_id)
-    if mid:
-        await safe_delete_message(call.bot, user.telegram_id, mid)
-        try:
-            await _clear_search_message_id(redis, user.telegram_id)
-        except Exception:
-            pass
-
-    # card already sends with dialog_reply_kb() via send_new_ui
-    await send_new_ui(call.bot, redis, user.telegram_id, my_card, kb=dialog_reply_kb())
-
-    # 2. Dequeue
+    await MatchmakingService(redis, settings).dequeue(tg_id)
     try:
-        await svc.dequeue_from_all(user.telegram_id, user.city)
+        await redis.delete(keys.ui_search_message_id(tg_id))
     except Exception:
-        logger.exception("failed_dequeue_on_match tg=%s", user.telegram_id)
+        pass
 
-    try:
-        await svc.dequeue_from_all(partner.telegram_id, partner.city)
-    except Exception:
-        logger.exception("failed_dequeue_on_match tg=%s", partner.telegram_id)
-
-    # Partner
-    try:
-        partner_mid = await _get_search_message_id(redis, result.partner_user_id)
-        if partner_mid:
-            await safe_delete_message(call.bot, result.partner_user_id, partner_mid)
-            try:
-                await _clear_search_message_id(redis, result.partner_user_id)
-            except Exception:
-                pass
-
-        await send_new_ui(call.bot, redis, result.partner_user_id, partner_card, kb=dialog_reply_kb())
-    except Exception:
-        logger.exception("failed_notify_partner tg=%s", result.partner_user_id)
-
-    await call.answer()
-    logger.info("search_matched dialog_id=%s u=%s p=%s", result.dialog_id, user.telegram_id, result.partner_user_id)
+    await show_profile(call.bot, redis, session, settings, tg_id)
+    await safe_answer_callback(call, "Поиск отменён")

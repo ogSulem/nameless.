@@ -1,83 +1,98 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import UTC, date, datetime
+from html import escape
 
 from aiogram import Bot
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.database.models import User
 from app.keyboards.profile import profile_kb
 from app.redis import keys
-from app.ui import edit_ui
+from app.ui import edit_ui, send_new_ui
+
+logger = logging.getLogger(__name__)
 
 
-def _fmt_sub_until(until: datetime | None) -> str:
-    if until is None:
-        return "нет"
-    dt = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
-    active = dt > datetime.now(tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M") + (" (active)" if active else " (expired)")
+def age_of(birth_date: date) -> int:
+    today = datetime.now(tz=UTC).date()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
 
 
-async def show_profile(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int) -> None:
-    cached = None
-    try:
-        cached = await redis.get(keys.profile_text(tg_id))
-    except Exception:
-        cached = None
-    if isinstance(cached, bytes):
-        try:
-            cached = cached.decode("utf-8", errors="replace")
-        except Exception:
-            cached = None
-    if isinstance(cached, str) and cached.strip():
-        await edit_ui(bot, redis, tg_id, cached, kb=profile_kb())
-        return
+def premium_active(user: User) -> bool:
+    if user.subscription_until is None:
+        return False
+    until = user.subscription_until
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return until > datetime.now(tz=UTC)
 
-    res = await session.execute(select(User).where(User.telegram_id == tg_id))
+
+def rating_line(user: User) -> str:
+    if int(user.chat_ratings_count or 0) == 0:
+        return "⭐ Рейтинг общения: <i>новый пользователь</i>"
+    line = f"⭐ Рейтинг общения: <b>{float(user.season_rating_chat or 0):.1f}</b>/10"
+    if int(user.appearance_ratings_count or 0) > 0:
+        line += f" · внешность: <b>{float(user.season_rating_appearance or 0):.1f}</b>/10"
+    return line
+
+
+def profile_text(user: User, settings: Settings) -> str:
+    gender_value = getattr(user.gender, "value", user.gender)
+    gender = "👦 парень" if gender_value == "male" else "👧 девушка"
+    city = escape(user.city) if user.city else "🌍 вся страна"
+    is_premium = premium_active(user)
+
+    lines = [
+        f"<b>👤 Профиль</b>{' 💎' if is_premium else ''}",
+        "",
+        f"Пол: {gender}",
+        f"Возраст: {age_of(user.birth_date)}",
+        f"Город: {city}",
+        rating_line(user),
+    ]
+    if is_premium and user.subscription_until is not None:
+        until = user.subscription_until
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=UTC)
+        lines.append(f"💎 Premium до <b>{until:%d.%m.%Y}</b>")
+    elif settings.payments_enabled:
+        lines.append("💎 Premium: собеседники с высоким рейтингом и приоритет в подборе")
+
+    if user.is_banned:
+        lines = ["🚫 <b>Аккаунт заблокирован.</b>", "", "Если вы считаете это ошибкой — напишите в поддержку."]
+    return "\n".join(lines)
+
+
+async def show_profile(
+    bot: Bot,
+    redis: Redis,
+    session: AsyncSession,
+    settings: Settings,
+    tg_id: int,
+    *,
+    new_message: bool = False,
+) -> None:
+    res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
     user = res.scalar_one_or_none()
     if user is None:
-        await edit_ui(bot, redis, tg_id, "Сначала запусти /start")
+        await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return
 
-    gender = "М" if user.gender.value == "male" else "Ж"
-    age = None
-    if user.birth_date:
-        today = datetime.now(tz=timezone.utc).date()
-        age = today.year - user.birth_date.year - (
-            (today.month, today.day) < (user.birth_date.month, user.birth_date.day)
-        )
+    text = profile_text(user, settings)
+    kb = profile_kb(premium=premium_active(user), payments_enabled=settings.payments_enabled)
+    if new_message:
+        await send_new_ui(bot, redis, tg_id, text, kb=kb)
+    else:
+        await edit_ui(bot, redis, tg_id, text, kb=kb)
 
-    city = user.city or "🌍 глобально"
-    sub = _fmt_sub_until(user.subscription_until)
-    is_premium = False
-    if user.subscription_until:
-        until_dt = user.subscription_until if user.subscription_until.tzinfo else user.subscription_until.replace(tzinfo=timezone.utc)
-        is_premium = until_dt > datetime.now(tz=timezone.utc)
-    
-    chat_r = float(user.season_rating_chat or 0.0)
-    app_r = float(user.season_rating_appearance or 0.0)
-    rating_line = f"Рейтинг: {chat_r:.1f}"
-    if app_r > 0:
-        rating_line += f" / {app_r:.1f}"
 
-    text = "\n".join(
-        [
-            "👤 *Профиль*" + (" 💎" if is_premium else ""),
-            f"Пол: {gender}",
-            f"Возраст: {age if age is not None else '-'}",
-            f"Город: {city}",
-            rating_line,
-            f"Premium: {sub}\n",
-            "💎 С Premium попадаются собеседники с рейтингом 7+" if not is_premium else "💎 У вас активен Premium статус!",
-        ]
-    )
-
+async def invalidate_profile(redis: Redis, tg_id: int) -> None:
     try:
-        await redis.set(keys.profile_text(tg_id), text, ex=10)
+        await redis.delete(keys.profile_text(int(tg_id)))
     except Exception:
         pass
-
-    await edit_ui(bot, redis, tg_id, text, kb=profile_kb())
