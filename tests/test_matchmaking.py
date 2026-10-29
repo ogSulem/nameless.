@@ -269,3 +269,31 @@ async def test_premium_user_is_matched_before_waiting_free_user(session, redis, 
 
     assert result is not None
     assert result.partner_telegram_id == 220
+
+
+@pytest.mark.asyncio
+async def test_premium_scan_batches_its_db_queries(session, engine, redis, settings, make_user):
+    """A premium scan over many candidates must not turn into N+1 round-trips."""
+    from sqlalchemy import event
+
+    svc = MatchmakingService(redis, settings)
+    for i in range(10):
+        cand = await make_user(900 + i, gender=Gender.female, rating=6.0 + i * 0.1, ratings_count=5)
+        await svc.enqueue(session, cand)
+
+    seeker = await make_user(990, gender=Gender.male)
+
+    selects: list[str] = []
+
+    def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        result = await svc.try_match(session, seeker, premium=True)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before_cursor_execute)
+
+    assert result is not None
+    assert len(selects) <= 8, f"too many queries for one match: {len(selects)}"

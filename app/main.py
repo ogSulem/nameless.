@@ -7,7 +7,9 @@ import secrets
 import sys
 import warnings
 
+import aiohttp
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand
@@ -160,8 +162,17 @@ async def run() -> int:
         settings.redis_username,
         settings.redis_password,
         settings.redis_url,
+        socket_timeout=settings.redis_socket_timeout,
+        connect_timeout=settings.redis_connect_timeout,
+        max_connections=settings.redis_max_connections,
     )
-    engine = create_engine(settings.database_dsn)
+    engine = create_engine(
+        settings.database_dsn,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        pool_recycle=settings.db_pool_recycle_s,
+    )
     session_factory = create_sessionmaker(engine)
 
     lock_value = await acquire_lock(redis)
@@ -179,7 +190,9 @@ async def run() -> int:
     async def check_redis() -> None:
         await redis.ping()
 
-    bot = Bot(token=settings.bot_token, parse_mode=None)
+    # A hung Telegram call must not pin a worker forever.
+    bot_session = AiohttpSession(timeout=aiohttp.ClientTimeout(total=settings.telegram_timeout_s))
+    bot = Bot(token=settings.bot_token, parse_mode=None, session=bot_session)
     routes = _webhook_routes(settings, redis, session_factory, bot)
 
     health: HealthServer | None = None

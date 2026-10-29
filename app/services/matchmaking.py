@@ -245,7 +245,16 @@ class MatchmakingService:
         premium: bool,
         mode: str = "chat",
     ) -> _Candidate | None:
+        """Pick a partner with ~3 round-trips per batch instead of ~3 per candidate.
+
+        High load used to mean: for every candidate in the queue a DB query, a
+        Redis call for "is online", a Redis call for "what do they seek" and
+        another DB query for an active dialog. Now a batch of candidates is
+        reserved first, then their state is fetched with one Redis pipeline and
+        two SQL queries.
+        """
         me = int(user.telegram_id)
+        my_gender = getattr(user.gender, "value", user.gender)
         checked: set[int] = set()
         reserved: list[_Candidate] = []
         skipped: list[_Candidate] = []
@@ -253,67 +262,74 @@ class MatchmakingService:
 
         try:
             last_partner = await self._last_partner(me)
+            batch_size = max(int(PREMIUM_PROBE), 4) if premium else 4
+            attempts = 0
 
-            for _ in range(MAX_RESERVE_ATTEMPTS):
-                raw = await self._reserve(queues, me)
-                if raw is None:
+            while attempts < 3:
+                attempts += 1
+                raws = await self._reserve_batch(queues, me, batch_size)
+                fresh: list[_Candidate] = []
+                for raw in raws:
+                    if raw.telegram_id in checked or raw.telegram_id in {me, last_partner}:
+                        skipped.append(raw)
+                        continue
+                    checked.add(raw.telegram_id)
+                    fresh.append(raw)
+                if not fresh:
                     break
 
-                if raw.telegram_id in checked:
-                    skipped.append(raw)
-                    continue
-                checked.add(raw.telegram_id)
+                ids = [c.telegram_id for c in fresh]
+                hints = await self._candidate_hints(ids)
+                rows = await self._load_candidates(session, ids)
+                busy = await self._active_db_ids(session, [r.db_id for r in rows.values()])
 
-                # Same partner as the previous dialog: keep them queued for others.
-                if raw.telegram_id == last_partner:
-                    skipped.append(raw)
-                    continue
+                for raw in fresh:
+                    online, seek, redis_busy = hints.get(raw.telegram_id, (True, None, False))
+                    if not online:
+                        await self._release(raw)  # ghost entry: drop it
+                        continue
 
-                if not await self.is_online(raw.telegram_id):
-                    await self._release(raw)  # ghost entry: drop it
-                    continue
+                    row = rows.get(raw.telegram_id)
+                    if row is None or row.db_id == user.id or row.is_banned or row.is_deleted:
+                        await self._release(raw)
+                        continue
 
-                row = await self._load_candidate(session, raw.telegram_id)
-                if row is None or row.db_id == user.id:
-                    await self._release(raw)
-                    continue
+                    cand = _Candidate(
+                        telegram_id=raw.telegram_id,
+                        db_id=row.db_id,
+                        queue_key=raw.queue_key,
+                        score=raw.score,
+                        rating=row.rating,
+                        ratings_count=row.ratings_count,
+                        appearance=row.appearance,
+                        appearance_count=row.appearance_count,
+                    )
 
-                cand = _Candidate(
-                    telegram_id=raw.telegram_id,
-                    db_id=row.db_id,
-                    queue_key=raw.queue_key,
-                    score=raw.score,
-                    rating=row.rating,
-                    ratings_count=row.ratings_count,
-                    appearance=row.appearance,
-                    appearance_count=row.appearance_count,
-                )
+                    # Mutual consent: they must be looking for my gender as well,
+                    # otherwise a woman seeking women could be matched with a man.
+                    candidate_seek = seek or seek_gender_for(row.gender)
+                    if candidate_seek != my_gender:
+                        skipped.append(cand)
+                        continue
 
-                if row.is_banned or row.is_deleted:
-                    await self._release(cand)
-                    continue
+                    if redis_busy or row.db_id in busy:
+                        await self._release(cand)
+                        continue
 
-                # Mutual consent: they must be looking for my gender as well,
-                # otherwise a woman seeking women could be matched with a man.
-                candidate_seek = await self._seek_gender(raw.telegram_id, row.gender)
-                my_gender = getattr(user.gender, "value", user.gender)
-                if candidate_seek != my_gender:
-                    skipped.append(cand)  # released and requeued in finally
-                    continue
+                    if not premium:
+                        chosen = cand
+                        return cand
 
-                if await session.get(ActiveDialog, cand.db_id) is not None:
-                    await self._release(cand)
-                    continue
+                    if self._qualifies_for_premium(cand, mode):
+                        chosen = cand
+                        return cand
 
-                if not premium:
-                    chosen = cand
-                    return cand
+                    if len(reserved) < int(PREMIUM_PROBE):
+                        reserved.append(cand)
+                    else:
+                        await self._release(cand, requeue=True)
 
-                reserved.append(cand)
-                if self._qualifies_for_premium(cand, mode):
-                    chosen = cand
-                    return cand
-                if len(reserved) >= PREMIUM_PROBE:
+                if not premium or len(reserved) >= int(PREMIUM_PROBE):
                     break
 
             if premium and reserved:
@@ -330,6 +346,93 @@ class MatchmakingService:
                 await self._release(cand, requeue=True)
             for cand in skipped:
                 await self._release(cand, requeue=True)
+
+    async def _reserve_batch(self, queues: list[str], me: int, size: int) -> list[_Candidate]:
+        out: list[_Candidate] = []
+        for _ in range(max(1, size)):
+            cand = await self._reserve(queues, me)
+            if cand is None:
+                break
+            out.append(cand)
+        return out
+
+    async def _candidate_hints(self, ids: list[int]) -> dict[int, tuple[bool, str | None, bool]]:
+        """One Redis round-trip for online/seek/busy of a whole batch."""
+        if not ids:
+            return {}
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            for tg in ids:
+                pipe.exists(keys.online_key(int(tg)))
+                pipe.get(keys.seek_gender_key(int(tg)))
+                pipe.exists(keys.active_dialog(int(tg)))
+            raw = await pipe.execute()
+        except Exception:
+            logger.warning("candidate_hints_failed", exc_info=True)
+            return {}
+
+        hints: dict[int, tuple[bool, str | None, bool]] = {}
+        for index, tg in enumerate(ids):
+            online, seek, busy = raw[index * 3 : index * 3 + 3]
+            seek_value = _as_str(seek)
+            hints[int(tg)] = (
+                bool(online),
+                seek_value if seek_value in {"male", "female"} else None,
+                bool(busy),
+            )
+        return hints
+
+    async def _load_candidates(
+        self, session: AsyncSession, ids: list[int]
+    ) -> dict[int, MatchmakingService._Row]:
+        if not ids:
+            return {}
+        try:
+            res = await session.execute(
+                select(
+                    User.id,
+                    User.telegram_id,
+                    User.is_banned,
+                    User.is_deleted,
+                    User.season_rating_chat,
+                    User.chat_ratings_count,
+                    User.season_rating_appearance,
+                    User.appearance_ratings_count,
+                    User.gender,
+                ).where(User.telegram_id.in_([int(i) for i in ids]))
+            )
+            rows = res.all()
+        except DBAPIError:
+            logger.exception("candidates_load_failed")
+            return {}
+
+        out: dict[int, MatchmakingService._Row] = {}
+        for row in rows:
+            out[int(row[1])] = self._Row(
+                db_id=int(row[0]),
+                is_banned=bool(row[2]),
+                is_deleted=bool(row[3]),
+                rating=float(row[4] or 0.0),
+                ratings_count=int(row[5] or 0),
+                appearance=float(row[6] or 0.0),
+                appearance_count=int(row[7] or 0),
+                gender=str(getattr(row[8], "value", row[8]) or "male"),
+            )
+        return out
+
+    async def _active_db_ids(self, session: AsyncSession, db_ids: list[int]) -> set[int]:
+        """Which of these users are already talking to somebody (authoritative check)."""
+        ids = [int(i) for i in db_ids]
+        if not ids:
+            return set()
+        try:
+            res = await session.execute(
+                select(ActiveDialog.user_id).where(ActiveDialog.user_id.in_(ids))
+            )
+            return {int(x) for x in res.scalars().all()}
+        except DBAPIError:
+            logger.warning("active_db_ids_failed", exc_info=True)
+            return set()
 
     def _qualifies_for_premium(self, cand: _Candidate, mode: str = "chat") -> bool:
         min_count = int(self._settings.rating_min_count)
@@ -395,37 +498,6 @@ class MatchmakingService:
         appearance: float = 0.0
         appearance_count: int = 0
         gender: str = "male"
-
-    async def _load_candidate(self, session: AsyncSession, tg_id: int) -> MatchmakingService._Row | None:
-        try:
-            res = await session.execute(
-                select(
-                    User.id,
-                    User.is_banned,
-                    User.is_deleted,
-                    User.season_rating_chat,
-                    User.chat_ratings_count,
-                    User.season_rating_appearance,
-                    User.appearance_ratings_count,
-                    User.gender,
-                ).where(User.telegram_id == int(tg_id))
-            )
-            row = res.one_or_none()
-        except DBAPIError:
-            logger.exception("candidate_load_failed tg=%s", tg_id)
-            return None
-        if row is None:
-            return None
-        return self._Row(
-            db_id=int(row[0]),
-            is_banned=bool(row[1]),
-            is_deleted=bool(row[2]),
-            rating=float(row[3] or 0.0),
-            ratings_count=int(row[4] or 0),
-            appearance=float(row[5] or 0.0),
-            appearance_count=int(row[6] or 0),
-            gender=str(getattr(row[7], "value", row[7]) or "male"),
-        )
 
     async def _create_dialog(self, session: AsyncSession, user: User, cand: _Candidate) -> int | None:
         try:

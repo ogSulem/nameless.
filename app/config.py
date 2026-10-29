@@ -58,6 +58,17 @@ class Settings(BaseSettings):
     # Promo codes (free Premium campaigns). Wrong guesses per user per hour.
     promo_attempts_per_hour: int = Field(default=10, alias="PROMO_ATTEMPTS_PER_HOUR")
 
+    # --- Reliability --------------------------------------------------------
+    # Sized for one polling instance; raise together with the DB max_connections.
+    db_pool_size: int = Field(default=10, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=10, alias="DB_MAX_OVERFLOW")
+    db_pool_timeout: int = Field(default=10, alias="DB_POOL_TIMEOUT")
+    db_pool_recycle_s: int = Field(default=1800, alias="DB_POOL_RECYCLE_S")
+    redis_socket_timeout: int = Field(default=5, alias="REDIS_SOCKET_TIMEOUT")
+    redis_connect_timeout: int = Field(default=5, alias="REDIS_CONNECT_TIMEOUT")
+    redis_max_connections: int = Field(default=50, alias="REDIS_MAX_CONNECTIONS")
+    telegram_timeout_s: int = Field(default=30, alias="TELEGRAM_TIMEOUT_S")
+
     # --- Anti-flood ---------------------------------------------------------
     messages_per_10s: int = Field(default=12, alias="MESSAGES_PER_10S")
     photos_per_minute: int = Field(default=6, alias="PHOTOS_PER_MINUTE")

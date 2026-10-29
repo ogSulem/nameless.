@@ -142,6 +142,26 @@ Telegram ──► middlewares ──► routers ──► handlers ──► se
    **явно помеченным** (🤖 «демо-собеседник») и никогда не смешивайте с платным
    подбором. Такой режим в бота не встроен намеренно.
 
+## Нагрузка и надёжность
+
+Что сделано, чтобы бот не «зависал» на первых же тысячах пользователей:
+
+| Место | Было | Стало |
+|---|---|---|
+| подбор собеседника | на каждого кандидата 1 SQL + 2 Redis-вызова | батч: 2 SQL на пачку + 1 Redis pipeline (`test_premium_scan_batches_its_db_queries` держит это в узде) |
+| пул БД | безразмерный дефолт, без таймаута ожидания | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_TIMEOUT` / `DB_POOL_RECYCLE_S`; `pool_pre_ping`, `pool_use_lifo`, `command_timeout=30` для Postgres |
+| Redis | мог висеть до бесконечности на полуоткрытом сокете | `REDIS_SOCKET_TIMEOUT`, `REDIS_CONNECT_TIMEOUT`, 2 быстрых ретрая, `health_check_interval=30`, `REDIS_MAX_CONNECTIONS` |
+| Telegram API | 60-секундное ожидание ответа | `TELEGRAM_TIMEOUT_S` (по умолчанию 30 с) |
+| очередь | Premium не имел приоритета | Premium встаёт в очередь на 2 минуты раньше (`PREMIUM_QUEUE_BOOST_S`) |
+| завершение | процесс мог умереть с открытыми сессиями | сигналы → отмена задач → закрытие FSM/HTTP/Redis/engine, релиз singleton-лока |
+
+Проверить под нагрузкой локально:
+
+```bash
+# 200 одновременных поисков на фейковом Redis/DB — быстрый smoke-тест
+pytest -q tests/test_matchmaking.py tests/test_e2e_flow.py
+```
+
 ## Панель модерации
 
 `/admin` в личке боту. Кнопка «Пользователь по ID» принимает и Telegram ID, и внутренний
@@ -209,6 +229,9 @@ SUPPORT=333333333           # только чтение
 | `REFERRAL_WELCOME_DAYS` | бонус самому приглашённому (0 = выключен, 7 = неделя на запуск) |
 | `REFERRAL_MAX_PER_DAY` | предел наград одному пригласившему в сутки (против ферм) |
 | `PROMO_ATTEMPTS_PER_HOUR` | сколько раз можно ошибиться с промокодом за час |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE_S` | пул Postgres под один инстанс |
+| `REDIS_SOCKET_TIMEOUT`, `REDIS_CONNECT_TIMEOUT`, `REDIS_MAX_CONNECTIONS` | чтобы Redis не подвешивал обработчики |
+| `TELEGRAM_TIMEOUT_S` | сколько ждать ответа Telegram API |
 | `PAYMENTS_PROVIDER_TOKEN` | Telegram Payments (чеки на стороне провайдера) |
 | `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` | прямая ЮKassa + вебхук `/yookassa/webhook` |
 | `RATING_*` | сглаживание рейтинга |
@@ -219,13 +242,14 @@ SUPPORT=333333333           # только чтение
 
 ## Тесты
 
-111 тестов, ~13 секунд, без внешних сервисов:
+119 тестов, ~10 секунд, без внешних сервисов:
 
 | файл | что проверяет |
 |---|---|
 | `test_e2e_flow.py` | весь путь через настоящий Dispatcher: согласие → регистрация → поиск → диалог → пересылка → оценка; отказ несовершеннолетним, `/delete_me`, **чистота чата** |
 | `test_referrals.py` | deep-link `/start ref_…`, начисление Premium пригласившему, защита от повторов и самоприглашения |
 | `test_promo.py` | промокоды: валидация, срок, лимит активаций, повтор, бан, атомарный счётчик, админ-создание |
+| `test_reliability.py` | пул БД с таймаутами, Redis fail-fast, `command_timeout`, дефолты нагрузочных настроек |
 | `test_admin_flow.py` | панель: доступ по ролям, бан, Premium, очередь жалоб, платежи, журнал |
 | `test_matchmaking.py` | матч, приоритет города, Premium, «не тот же партнёр», возврат кандидата |
 | `test_dialog_service.py` | восстановление кэша из БД, heartbeat, sweep «зависших» диалогов |
