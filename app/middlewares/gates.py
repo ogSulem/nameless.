@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.database.models import User
+from app.telegram_safe import safe_send_message
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ class BanGateMiddleware(BaseMiddleware):
         message: Message | None = event.message
         if message is not None and message.chat is not None:
             try:
-                await message.bot.send_message(message.chat.id, BAN_TEXT)
+                # parse_mode is required: BAN_TEXT contains <b> tags.
+                await safe_send_message(
+                    message.bot, message.chat.id, BAN_TEXT, parse_mode="HTML"
+                )
             except Exception:
                 logger.debug("ban_gate_send_failed", exc_info=True)
