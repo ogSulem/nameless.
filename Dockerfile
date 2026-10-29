@@ -39,7 +39,8 @@ USER appuser
 
 # Never run as root; expose only the health endpoint.
 EXPOSE 8080
+# Railway (and most PaaS) inject PORT; never hard-code 8080 here.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; port=os.getenv('PORT','8080'); sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/healthz' % port, timeout=3).status==200 else 1)"
 
 ENTRYPOINT ["/app/entrypoint.sh"]

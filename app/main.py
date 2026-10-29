@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import secrets
+import signal
 import sys
 import warnings
 
@@ -227,16 +228,45 @@ async def run() -> int:
         asyncio.create_task(sweeper_loop(settings, redis, session_factory)),
     ]
 
+    # If the bot was ever used with a webhook (another host, hand-made setup),
+    # polling dies with TelegramConflictError. Polling is the only supported mode.
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        logger.warning("delete_webhook_failed", exc_info=True)
+
     try:
         await bot.set_my_commands(COMMANDS)
     except Exception:
         logger.warning("set_my_commands_failed", exc_info=True)
 
+    # Graceful shutdown: Railway sends SIGTERM, then SIGKILL after draining.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, stop.set)
+
     backoff = 1
     try:
         while True:
+            polling = asyncio.create_task(
+                dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            )
+            waiter = asyncio.create_task(stop.wait())
             try:
-                await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+                done, _ = await asyncio.wait(
+                    {polling, waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if waiter in done and not polling.done():
+                    # SIGTERM/SIGINT: stop taking updates, then exit through finally.
+                    logger.info("shutdown_signal_received")
+                    polling.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await polling
+                    return 0
+
+                polling.result()  # re-raises whatever killed polling
                 logger.info("polling_stopped")
                 return 0
             except asyncio.CancelledError:
@@ -252,6 +282,10 @@ async def run() -> int:
                 logger.warning("telegram_network_error", exc_info=True)
             except Exception:
                 logger.exception("polling_crashed")
+            finally:
+                waiter.cancel()
+                with contextlib.suppress(BaseException):
+                    await waiter
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
