@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 from sqlalchemy import select
 
@@ -192,3 +194,37 @@ async def test_pending_payment_expires_from_redis(session, redis, settings, make
 
     await svc.create_telegram_invoice(session, FakeBot(), user)
     assert await svc._pending_id(507) is not None
+
+
+@pytest.mark.asyncio
+async def test_successful_payment_activates_premium_and_profile(bot, dispatcher, session, redis, settings, make_user):
+    """Деньги → Premium → карточка профиля: сквозная проверка без Telegram."""
+    from datetime import datetime, timezone
+
+    from app.database.models import Payment
+    from app.services.payments import PaymentService
+
+    paying = settings.model_copy(
+        update={"payments_provider_token": "provider-token"}
+    )
+    user = await make_user(9080)
+    svc = PaymentService(paying, redis)
+
+    class FakeBot:
+        async def create_invoice_link(self, **kwargs):
+            return "https://t.me/$invoice"
+
+    init = await svc.create_telegram_invoice(session, FakeBot(), user)  # type: ignore[arg-type]
+    payment = (await session.execute(select(Payment))).scalar_one()
+    assert payment.status == "pending"
+
+    ok, until = await svc.complete_telegram_payment(
+        session, FakeSuccessfulPayment(f"premium:{init.payment_id}")
+    )
+    assert ok is True and until is not None
+
+    await session.refresh(user)
+    assert user.subscription_until is not None
+    assert payment.status == "paid"
+    assert payment.paid_at is not None
+    assert payment.paid_at <= datetime.now(tz=UTC)

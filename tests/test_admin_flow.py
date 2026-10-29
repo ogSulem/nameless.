@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 
 from app.database.models import Complaint, ComplaintStatus
@@ -180,3 +182,33 @@ async def test_unknown_user_lookup_is_graceful(bot, dispatcher, session):
 
     assert "не найден" in bot.session.last_text().lower()
     assert await find_user(session, 999999999) is None
+
+
+@pytest.mark.asyncio
+async def test_premium_mode_toggle_changes_matching_preference(bot, dispatcher, session, redis, settings, make_user):
+    from datetime import datetime, timedelta, timezone
+
+    user = await make_user(5010)
+    user.subscription_until = datetime.now(tz=UTC) + timedelta(days=10)
+    await session.commit()
+
+    await press(bot, dispatcher, 5010, "premium:mode")
+    from app.services.matchmaking import MatchmakingService
+
+    assert await MatchmakingService(redis, settings).premium_mode(5010) == "appearance"
+
+    await press(bot, dispatcher, 5010, "premium:mode")
+    assert await MatchmakingService(redis, settings).premium_mode(5010) == "chat"
+
+
+@pytest.mark.asyncio
+async def test_premium_mode_requires_active_subscription(bot, dispatcher, session, redis, settings, make_user):
+    from app.services.matchmaking import MatchmakingService
+
+    await make_user(5011)
+
+    await press(bot, dispatcher, 5011, "premium:mode")
+
+    answers = " ".join(a for a in bot.session.answers if a)
+    assert "Premium" in answers
+    assert await MatchmakingService(redis, settings).premium_mode(5011) == "chat"

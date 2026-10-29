@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 PREMIUM_CACHE_TTL_S = 60
 MAX_RESERVE_ATTEMPTS = 25
 PREMIUM_PROBE = 6
+# Premium profiles are pushed to the front of the queue (~2 minutes of head start).
+PREMIUM_QUEUE_BOOST_S = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +38,13 @@ class _Candidate:
     score: str
     rating: float = 0.0
     ratings_count: int = 0
+    appearance: float = 0.0
+    appearance_count: int = 0
+
+    def metric(self, mode: str) -> tuple[float, int]:
+        if mode == "appearance":
+            return self.appearance, self.appearance_count
+        return self.rating, self.ratings_count
 
 
 def seek_gender_for(gender: str) -> str:
@@ -107,12 +116,13 @@ class MatchmakingService:
         global_key = keys.queue_key(user.gender.value, None)
         now = datetime.now(tz=UTC).timestamp()
         tg = int(user.telegram_id)
+        score = now - PREMIUM_QUEUE_BOOST_S if _is_premium_now(user) else now
 
         try:
             pipe = self._redis.pipeline(transaction=False)
-            pipe.zadd(qkey, {str(tg): now})
+            pipe.zadd(qkey, {str(tg): score})
             if global_key != qkey:
-                pipe.zadd(global_key, {str(tg): now})
+                pipe.zadd(global_key, {str(tg): score})
             pipe.set(keys.queue_member_key(tg), _member_payload(user), ex=int(self._settings.online_ttl_s))
             pipe.set(
                 keys.seek_gender_key(tg),
@@ -143,13 +153,30 @@ class MatchmakingService:
         except Exception:
             logger.warning("dequeue_failed tg=%s", tg, exc_info=True)
 
-    async def queue_size(self, gender: str, city: str | None) -> int:
+    async def queue_size(self, gender: str, city: str | None = None) -> int:
+        """How many people are waiting for this gender right now."""
         try:
             return int(await self._redis.zcard(keys.queue_key(gender, city)))
         except Exception:
             return 0
 
     # ------------------------------------------------------------------- match
+    async def premium_mode(self, telegram_id: int) -> str:
+        """What a Premium user asked to prioritise: `appearance` or `chat`."""
+        try:
+            raw = _as_str(await self._redis.get(keys.premium_pref_key(int(telegram_id))))
+        except Exception:
+            return "chat"
+        return "appearance" if raw == "appearance" else "chat"
+
+    async def set_premium_mode(self, telegram_id: int, mode: str) -> str:
+        mode = "appearance" if mode == "appearance" else "chat"
+        try:
+            await self._redis.set(keys.premium_pref_key(int(telegram_id)), mode, ex=60 * 60 * 24 * 365)
+        except Exception:
+            logger.warning("premium_mode_save_failed tg=%s", telegram_id, exc_info=True)
+        return mode
+
     async def try_match(self, session: AsyncSession, user: User, premium: bool) -> MatchResult | None:
         tg = int(user.telegram_id)
 
@@ -166,7 +193,8 @@ class MatchmakingService:
             queues.append(keys.queue_key(seek, user.city))
         queues.append(keys.queue_key(seek, None))
 
-        candidate = await self._pick_candidate(session, user, queues, premium)
+        mode = await self.premium_mode(tg) if premium else "chat"
+        candidate = await self._pick_candidate(session, user, queues, premium, mode)
         if candidate is None:
             await self.enqueue(session, user)
             logger.info("match_enqueued tg=%s premium=%s queues=%s", tg, premium, queues)
@@ -215,6 +243,7 @@ class MatchmakingService:
         user: User,
         queues: list[str],
         premium: bool,
+        mode: str = "chat",
     ) -> _Candidate | None:
         me = int(user.telegram_id)
         checked: set[int] = set()
@@ -256,10 +285,20 @@ class MatchmakingService:
                     score=raw.score,
                     rating=row.rating,
                     ratings_count=row.ratings_count,
+                    appearance=row.appearance,
+                    appearance_count=row.appearance_count,
                 )
 
                 if row.is_banned or row.is_deleted:
                     await self._release(cand)
+                    continue
+
+                # Mutual consent: they must be looking for my gender as well,
+                # otherwise a woman seeking women could be matched with a man.
+                candidate_seek = await self._seek_gender(raw.telegram_id, row.gender)
+                my_gender = getattr(user.gender, "value", user.gender)
+                if candidate_seek != my_gender:
+                    skipped.append(cand)  # released and requeued in finally
                     continue
 
                 if await session.get(ActiveDialog, cand.db_id) is not None:
@@ -271,15 +310,16 @@ class MatchmakingService:
                     return cand
 
                 reserved.append(cand)
-                if self._qualifies_for_premium(cand):
+                if self._qualifies_for_premium(cand, mode):
                     chosen = cand
                     return cand
                 if len(reserved) >= PREMIUM_PROBE:
                     break
 
             if premium and reserved:
-                # Honest fallback, documented in the terms: best available.
-                chosen = max(reserved, key=lambda c: (c.rating, c.ratings_count))
+                # Honest fallback, documented in the terms: best available by the
+                # chosen metric, so a Premium user never waits forever.
+                chosen = max(reserved, key=lambda c: c.metric(mode))
                 return chosen
 
             return None
@@ -291,10 +331,16 @@ class MatchmakingService:
             for cand in skipped:
                 await self._release(cand, requeue=True)
 
-    def _qualifies_for_premium(self, cand: _Candidate) -> bool:
+    def _qualifies_for_premium(self, cand: _Candidate, mode: str = "chat") -> bool:
+        min_count = int(self._settings.rating_min_count)
+        if mode == "appearance":
+            return (
+                cand.appearance >= float(self._settings.premium_min_appearance)
+                and cand.appearance_count >= min_count
+            )
         return (
             cand.rating >= float(self._settings.premium_min_rating)
-            and cand.ratings_count >= int(self._settings.rating_min_count)
+            and cand.ratings_count >= min_count
         )
 
     async def _reserve(self, queues: list[str], me: int) -> _Candidate | None:
@@ -346,6 +392,9 @@ class MatchmakingService:
         is_deleted: bool
         rating: float
         ratings_count: int
+        appearance: float = 0.0
+        appearance_count: int = 0
+        gender: str = "male"
 
     async def _load_candidate(self, session: AsyncSession, tg_id: int) -> MatchmakingService._Row | None:
         try:
@@ -356,6 +405,9 @@ class MatchmakingService:
                     User.is_deleted,
                     User.season_rating_chat,
                     User.chat_ratings_count,
+                    User.season_rating_appearance,
+                    User.appearance_ratings_count,
+                    User.gender,
                 ).where(User.telegram_id == int(tg_id))
             )
             row = res.one_or_none()
@@ -370,6 +422,9 @@ class MatchmakingService:
             is_deleted=bool(row[2]),
             rating=float(row[3] or 0.0),
             ratings_count=int(row[4] or 0),
+            appearance=float(row[5] or 0.0),
+            appearance_count=int(row[6] or 0),
+            gender=str(getattr(row[7], "value", row[7]) or "male"),
         )
 
     async def _create_dialog(self, session: AsyncSession, user: User, cand: _Candidate) -> int | None:
@@ -418,6 +473,15 @@ class MatchmakingService:
         except Exception:
             # The DB already knows about the dialog; DialogService repairs the cache.
             logger.exception("publish_active_failed dialog_id=%s", dialog_id)
+
+
+def _is_premium_now(user: User) -> bool:
+    until = getattr(user, "subscription_until", None)
+    if until is None:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return until > datetime.now(tz=UTC)
 
 
 def _member_payload(user: User) -> str:

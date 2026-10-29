@@ -44,6 +44,9 @@ async def test_full_journey(bot, dispatcher, session, make_user):
 
     dialog = (await session.execute(select(Dialog))).scalars().first()
     assert dialog is not None, "the two searches must have produced a dialog"
+    # Profile and "searching" screens are removed; only the partner card is left.
+    assert bot.session.live_count(9001) == 1, bot.session.live
+    assert bot.session.live_count(9002) == 1, bot.session.live
 
     await send_text(bot, dispatcher, 9002, "привет!")
     await session.commit()
@@ -63,6 +66,10 @@ async def test_full_journey(bot, dispatcher, session, make_user):
     await session.commit()
     ratings = (await session.execute(select(Rating))).scalars().all()
     assert [r.value for r in ratings] == [8]
+
+    # Chat hygiene: after a full dialog the user keeps exactly one bot message.
+    assert bot.session.live_count(9001) == 1, bot.session.live
+    assert bot.session.live_count(9002) == 1, bot.session.live
 
 
 @pytest.mark.asyncio
@@ -142,3 +149,63 @@ async def test_profile_seek_change_is_stored(bot, dispatcher, session, redis, ma
     await press(bot, dispatcher, 9061, "pfseek:female")
 
     assert await redis.get(keys.seek_gender_key(9061)) == "female"
+
+
+@pytest.mark.asyncio
+async def test_empty_queue_screen_offers_invite(bot, dispatcher, session, make_user):
+    await _register(bot, dispatcher, 9070)
+
+    await press(bot, dispatcher, 9070, "search:start")
+
+    text = bot.session.last_text()
+    assert "в очереди никого нет" in text
+    assert "/invite" in text
+    assert bot.session.live_count(9070) == 1
+
+
+@pytest.mark.asyncio
+async def test_documents_and_help_keep_one_message(bot, dispatcher, session, make_user):
+    await _register(bot, dispatcher, 9071)
+
+    for command in ("/help", "/privacy", "/terms", "/delete_me"):
+        await send_text(bot, dispatcher, 9071, command)
+        assert bot.session.live_count(9071) == 1, (command, bot.session.live)
+
+    # The user's own command messages are deleted too.
+    assert bot.session.deleted
+
+
+@pytest.mark.asyncio
+async def test_rating_prompt_can_be_skipped(bot, dispatcher, session, make_user):
+    await _register(bot, dispatcher, 9074)
+    await press(bot, dispatcher, 9074, "search:start")
+
+    # No partner available → cancel and make sure we are back on the profile screen.
+    await press(bot, dispatcher, 9074, "search:cancel")
+    assert "Профиль" in bot.session.last_text()
+    assert bot.session.live_count(9074) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_partner_is_detected_at_match(bot, dispatcher, session, redis, settings, make_user):
+    """Если собеседник заблокировал бота, второй не должен остаться в мёртвом диалоге."""
+    from app.database.models import ActiveDialog, DialogStatus
+    from app.database.models import Dialog as DbDialog
+    from app.services.matchmaking import MatchmakingService
+
+    await _register(bot, dispatcher, 9090)
+    partner = await make_user(9091, gender="female", city="Москва")
+    await MatchmakingService(redis, settings).enqueue(session, partner)
+
+    # 9091 blocked the bot between registration and the match.
+    bot.session.blocked_chats.add(9091)
+
+    await press(bot, dispatcher, 9090, "search:start")
+
+    await session.commit()
+    dialogs = (await session.execute(select(DbDialog))).scalars().all()
+    assert dialogs, "the match itself happened"
+    assert all(d.status == DialogStatus.finished for d in dialogs)
+    active = (await session.execute(select(ActiveDialog))).scalars().all()
+    assert active == []
+    assert "не может получать сообщения" in bot.session.all_text()

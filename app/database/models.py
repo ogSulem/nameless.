@@ -68,6 +68,10 @@ class User(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
+    # Growth: who invited this user (telegram id) and whether the bonus was paid.
+    invited_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    invite_rewarded: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
@@ -76,6 +80,7 @@ class User(Base):
         Index("ix_users_season_rating_chat", "season_rating_chat"),
         Index("ix_users_season_rating_appearance", "season_rating_appearance"),
         Index("ix_users_created_at", "created_at"),
+        Index("ix_users_invited_by", "invited_by"),
         Index("ix_users_premium_match", "season_rating_chat", "season_rating_appearance"),
     )
 

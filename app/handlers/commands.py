@@ -9,7 +9,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from redis.asyncio import Redis
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -56,9 +56,17 @@ async def caretaker_purge(bot: Bot, session: AsyncSession, redis: Redis, setting
         for other in tgs or []:
             if other != tg_id:
                 try:
-                    await bot.send_message(other, "Диалог завершён: собеседник удалил профиль.")
+                    # Replaces the partner card: the chat keeps a single screen.
+                    await send_new_ui(
+                        bot,
+                        redis,
+                        other,
+                        "Диалог завершён: собеседник удалил профиль.\n\n"
+                        "Нажмите /start, чтобы найти нового.",
+                        kb=back_kb("search:start", "🔎 Найти собеседника"),
+                    )
                 except Exception:
-                    pass
+                    logger.info("purge_notify_failed tg=%s", other)
 
     user = await get_user(session, tg_id)
     if user is not None:
@@ -130,6 +138,11 @@ async def cmd_start(
     await MatchmakingService(redis, settings).mark_online(tg_id)
 
     user = await get_user(session, tg_id)
+    inviter = None
+    if user is None:
+        candidate = _parse_invite(message.text or "")
+        if candidate is not None and candidate != tg_id:
+            inviter = candidate
 
     if user is not None:
         if user.is_banned:
@@ -162,6 +175,9 @@ async def cmd_start(
 
     await state.clear()
     await state.set_state(Registration.consent)
+    if inviter is not None:
+        # Written *after* clear(), otherwise the invite payload is wiped.
+        await state.update_data(invited_by=inviter)
     await send_new_ui(
         bot,
         redis,
@@ -324,6 +340,10 @@ async def reg_seek(
 
     consent_at = data.get("consent_at")
     consent_version = data.get("consent_version") or settings.terms_version
+    invited_by = data.get("invited_by")
+    invited_by = int(invited_by) if isinstance(invited_by, int | str) and str(invited_by).isdigit() else None
+    if invited_by == tg_id:
+        invited_by = None
 
     user = await get_user(session, tg_id)
     if user is None:
@@ -335,6 +355,7 @@ async def reg_seek(
             consent_at=datetime.fromisoformat(consent_at) if consent_at else datetime.now(tz=UTC),
             consent_version=str(consent_version),
             last_seen_at=datetime.now(tz=UTC),
+            invited_by=invited_by,
         )
         session.add(user)
         try:
@@ -349,6 +370,9 @@ async def reg_seek(
     await _store_seek(redis, tg_id, seek, fallback_gender=gender)
     await state.clear()
     logger.info("registration_done tg=%s city=%s seek=%s", tg_id, user.city, seek)
+
+    if invited_by:
+        await _pay_referral(call.bot, redis, session, settings, inviter_tg=invited_by, invitee=user)
 
     await show_profile(call.bot, redis, session, settings, tg_id, new_message=True)
     await safe_answer_callback(call, "Готово! Ищем?")
@@ -415,6 +439,129 @@ async def delete_confirm(call: CallbackQuery, session: AsyncSession, redis: Redi
         "Профиль и данные удалены. Спасибо, что заглянули 💎\n\nНажмите /start, чтобы вернуться.",
     )
     await safe_answer_callback(call, "Данные удалены")
+
+
+# -------------------------------------------------------------------- referrals
+def _parse_invite(text: str) -> int | None:
+    """`/start ref_123456` → 123456."""
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    payload = parts[1].strip()
+    if not payload.startswith("ref_"):
+        return None
+    raw = payload[4:]
+    return int(raw) if raw.isdigit() else None
+
+
+def invite_link(bot_username: str, tg_id: int) -> str:
+    return f"https://t.me/{bot_username}?start=ref_{int(tg_id)}"
+
+
+async def _pay_referral(
+    bot: Bot,
+    redis: Redis,
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    inviter_tg: int,
+    invitee: User,
+) -> None:
+    """Give the inviter Premium days for a friend who actually registered.
+
+    Guards: the inviter must exist and not be banned; the bonus is paid once per
+    invitee (`invite_rewarded`), so a replayed /start cannot farm days.
+    """
+    days = int(settings.referral_reward_days)
+    if days <= 0 or invitee.invite_rewarded:
+        return
+
+    inviter = await get_user(session, inviter_tg)
+    if inviter is None or inviter.is_banned:
+        return
+
+    from app.services import admin as admin_service
+    from app.services.subscription import SubscriptionService
+
+    invitee.invite_rewarded = True
+    await session.commit()
+
+    until = await SubscriptionService().extend_subscription(
+        session=session, telegram_id=inviter_tg, days=days
+    )
+    await MatchmakingService(redis, settings).invalidate_premium(inviter_tg)
+    await admin_service.log_action(
+        session,
+        admin_tg=0,
+        action="referral_bonus",
+        target_tg=inviter_tg,
+        details=f"+{days}d за приглашённого {invitee.telegram_id}",
+    )
+    try:
+        # Replaces the inviter's current screen, so the chat stays at one message.
+        await send_new_ui(
+            bot,
+            redis,
+            inviter_tg,
+            f"🎁 <b>+{days} дней Premium</b> за приглашённого друга!\n\n"
+            f"Теперь Premium активен до <b>{until:%d.%m.%Y}</b>.",
+            kb=back_kb("menu:profile"),
+        )
+    except Exception:
+        logger.info("referral_notify_failed tg=%s", inviter_tg)
+    logger.info("referral_paid inviter=%s invitee=%s days=%s", inviter_tg, invitee.telegram_id, days)
+
+
+async def _invite_screen(bot: Bot, redis: Redis, session: AsyncSession, settings: Settings, tg_id: int) -> None:
+    try:
+        me = await bot.me()
+        username = me.username or ""
+    except Exception:
+        username = ""
+    if not username:
+        await edit_ui(
+            bot, redis, tg_id,
+            "🎁 <b>Приглашения</b>\n\nСсылка-приглашение пока недоступна. "
+            "Перешлите другу @username бота.",
+            kb=back_kb("menu:profile"),
+        )
+        return
+
+    invited = int(
+        (
+            await session.execute(
+                select(func.count(User.id)).where(User.invited_by == tg_id)
+            )
+        ).scalar_one()
+        or 0
+    )
+    reward = int(settings.referral_reward_days)
+    await edit_ui(
+        bot, redis, tg_id,
+        "🎁 <b>Пригласите друга</b>\n\n"
+        f"За каждого друга, который зарегистрируется по ссылке, вы получаете "
+        f"<b>+{reward} дней Premium</b>.\n\n"
+        f"Уже приглашено: <b>{invited}</b>\n\n"
+        f"<code>{invite_link(username, tg_id)}</code>\n\n"
+        "<i>Награда начисляется один раз за каждого нового пользователя.</i>",
+        kb=back_kb("menu:profile"),
+    )
+
+
+@router.message(Command("invite"))
+async def cmd_invite(
+    message: Message, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    await _delete(message)
+    await _invite_screen(message.bot, redis, session, settings, int(message.from_user.id))
+
+
+@router.callback_query(F.data == "menu:invite")
+async def menu_invite(
+    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    await _invite_screen(call.bot, redis, session, settings, int(call.from_user.id))
+    await safe_answer_callback(call)
 
 
 # ---------------------------------------------------------------- profile edit

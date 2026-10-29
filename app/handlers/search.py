@@ -13,7 +13,7 @@ from app.handlers.commands import get_user
 from app.keyboards.search import searching_kb
 from app.redis import keys
 from app.services.dialog import DialogService
-from app.services.matchmaking import MatchmakingService
+from app.services.matchmaking import MatchmakingService, seek_gender_for
 from app.services.notifications import announce_match
 from app.telegram_safe import safe_answer_callback
 from app.ui import edit_ui, get_ui_message_id
@@ -27,6 +27,16 @@ SEARCHING_TEXT = (
     "Обычно это занимает несколько секунд. Если в очереди сейчас никого нет — "
     "оставьте поиск включённым: как только появится подходящий человек, я сразу "
     "пришлю карточку.\n\n"
+    "<i>Можно закрыть чат — поиск продолжится.</i>\n\n"
+    "🎁 Позвать друга: /invite"
+)
+
+EMPTY_QUEUE_TEXT = (
+    "🔎 <b>Ищу собеседника…</b>\n\n"
+    "Сейчас в очереди никого нет — вы первый. Поиск остаётся включённым: как только "
+    "кто-то появится, я сразу пришлю карточку.\n\n"
+    "Так сервис растёт быстрее всего вдвоём: <b>🎁 /invite</b> — за друга, который "
+    "зарегистрируется, вы получаете дни Premium.\n\n"
     "<i>Можно закрыть чат — поиск продолжится.</i>"
 )
 
@@ -55,7 +65,11 @@ async def start_search_for(
     result = await matchmaking.try_match(session=session, user=user, premium=premium)
 
     if result is None:
-        await edit_ui(bot, redis, tg_id, SEARCHING_TEXT, kb=searching_kb())
+        waiting = await matchmaking.queue_size(
+            seek_gender_for(getattr(user.gender, "value", user.gender)), None
+        )
+        text = SEARCHING_TEXT if waiting > 1 else EMPTY_QUEUE_TEXT
+        await edit_ui(bot, redis, tg_id, text, kb=searching_kb())
         mid = await get_ui_message_id(redis, tg_id)
         if mid:
             try:

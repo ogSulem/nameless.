@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     online_ttl_s: int = Field(default=900, alias="ONLINE_TTL_S")
     dialog_max_hours: int = Field(default=12, alias="DIALOG_MAX_HOURS")
     premium_min_rating: float = Field(default=7.0, alias="PREMIUM_MIN_RATING")
+    premium_min_appearance: float = Field(default=7.0, alias="PREMIUM_MIN_APPEARANCE")
+
+    # --- Growth -------------------------------------------------------------
+    # Premium days for inviting a friend. 0 disables the reward (invites still work).
+    referral_reward_days: int = Field(default=7, alias="REFERRAL_REWARD_DAYS")
 
     # --- Anti-flood ---------------------------------------------------------
     messages_per_10s: int = Field(default=12, alias="MESSAGES_PER_10S")

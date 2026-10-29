@@ -13,6 +13,7 @@ from app.config import Settings
 from app.database.models import User
 from app.keyboards.profile import profile_kb
 from app.redis import keys
+from app.services.matchmaking import MatchmakingService
 from app.ui import edit_ui, send_new_ui
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def rating_line(user: User) -> str:
     return line
 
 
-def profile_text(user: User, settings: Settings) -> str:
+def profile_text(user: User, settings: Settings, premium_mode: str = "chat") -> str:
     gender_value = getattr(user.gender, "value", user.gender)
     gender = "👦 парень" if gender_value == "male" else "👧 девушка"
     city = escape(user.city) if user.city else "🌍 вся страна"
@@ -59,7 +60,8 @@ def profile_text(user: User, settings: Settings) -> str:
         until = user.subscription_until
         if until.tzinfo is None:
             until = until.replace(tzinfo=UTC)
-        lines.append(f"💎 Premium до <b>{until:%d.%m.%Y}</b>")
+        mode_label = "внешность" if premium_mode == "appearance" else "общение"
+        lines.append(f"💎 Premium до <b>{until:%d.%m.%Y}</b> · подбор по: <b>{mode_label}</b>")
     elif settings.payments_enabled:
         lines.append("💎 Premium: собеседники с высоким рейтингом и приоритет в подборе")
 
@@ -83,8 +85,18 @@ async def show_profile(
         await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return
 
-    text = profile_text(user, settings)
-    kb = profile_kb(premium=premium_active(user), payments_enabled=settings.payments_enabled)
+    is_premium = premium_active(user)
+    mode = "chat"
+    if is_premium:
+        try:
+            mode = await MatchmakingService(redis, settings).premium_mode(int(tg_id))
+        except Exception:
+            mode = "chat"
+
+    text = profile_text(user, settings, premium_mode=mode)
+    kb = profile_kb(
+        premium=is_premium, payments_enabled=settings.payments_enabled, premium_mode=mode
+    )
     if new_message:
         await send_new_ui(bot, redis, tg_id, text, kb=kb)
     else:

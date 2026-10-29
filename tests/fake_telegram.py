@@ -52,10 +52,14 @@ class FakeSession(BaseSession):
         self.edited: list[Any] = []
         self.deleted: list[int] = []
         self.text_log: list[str] = []
+        # What each chat would actually show right now: (chat_id, message_id) -> text.
+        self.live: dict[tuple[int, int], str] = {}
         self.answers: list[str | None] = []
         self.copied: list[Any] = []
         self.invoices: list[Any] = []
         self._next_id = 1000
+        # Chats where the bot is blocked: every send fails like real Telegram does.
+        self.blocked_chats: set[int] = set()
 
     async def close(self) -> None:  # pragma: no cover - nothing to close
         return None
@@ -64,6 +68,15 @@ class FakeSession(BaseSession):
         raise NotImplementedError
 
     async def make_request(self, bot: Bot, method: Any, timeout: int | None = None) -> Any:
+        chat_id = getattr(method, "chat_id", None)
+        if chat_id in self.blocked_chats and not isinstance(
+            method, (GetMe, SetMyCommands, AnswerCallbackQuery, DeleteMessage)
+        ):
+            from aiogram.exceptions import TelegramForbiddenError
+
+            raise TelegramForbiddenError(
+                method=method, message="Forbidden: bot was blocked by the user"
+            )
         self.sent.append(method)
         self._next_id += 1
 
@@ -74,6 +87,7 @@ class FakeSession(BaseSession):
             return True
         if isinstance(method, SendMessage):
             self.text_log.append(method.text or "")
+            self.live[(method.chat_id, self._next_id)] = method.text or ""
             return Message.model_construct(
                 message_id=self._next_id,
                 date=None,
@@ -104,6 +118,7 @@ class FakeSession(BaseSession):
             )
         if isinstance(method, DeleteMessage):
             self.deleted.append(method.message_id)
+            self.live.pop((method.chat_id, method.message_id), None)
             return True
         if isinstance(method, AnswerCallbackQuery):
             self.answers.append(method.text)
@@ -122,6 +137,14 @@ class FakeSession(BaseSession):
     def last_text(self) -> str:
         assert self.text_log, "the bot rendered nothing"
         return self.text_log[-1]
+
+    def live_count(self, chat_id: int | None = None) -> int:
+        if chat_id is None:
+            return len(self.live)
+        return sum(1 for cid, _ in self.live if cid == chat_id)
+
+    def live_text(self, chat_id: int) -> str:
+        return "\n".join(text for (cid, _), text in self.live.items() if cid == chat_id)
 
     def all_text(self) -> str:
         return "\n".join(self.text_log)

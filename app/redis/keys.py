@@ -37,6 +37,10 @@ def lock_rating(tg_id: int) -> str:
 
 
 # -------------------------------------------------------------------- dialog
+def premium_pref_key(tg_id: int) -> str:
+    return f"premium_pref:{int(tg_id)}"
+
+
 def active_dialog(tg_id: int) -> str:
     return f"active_dialog:{tg_id}"
 

@@ -19,8 +19,13 @@ from app.keyboards.rating import rating_kb
 from app.redis import keys
 from app.services.dialog import DialogInfo, DialogService
 from app.services.vision import FaceDetector
-from app.telegram_safe import UserBlockedBot, safe_copy_message, safe_send_message
-from app.ui import edit_ui, get_ui_message_id
+from app.telegram_safe import (
+    UserBlockedBot,
+    safe_copy_message,
+    safe_delete_message,
+    safe_send_message,
+)
+from app.ui import clear_ui_message_id, edit_ui, get_ui_message_id, set_ui_message_id
 from app.utils.ratelimit import hit, rate_limit
 
 logger = logging.getLogger(__name__)
@@ -76,8 +81,16 @@ async def finish_dialog(
         logger.exception("finish_dialog_state_failed dialog_id=%s", dialog_id)
 
     for tg in telegram_ids:
+        # One card in, one card out: the partner card is removed, and the "dialog
+        # finished" message is immediately reused as the rating screen, so the chat
+        # never accumulates stale bot messages.
+        old_mid = await get_ui_message_id(redis, tg)
+        if old_mid:
+            await safe_delete_message(bot, tg, old_mid)
+            await clear_ui_message_id(redis, tg)
+
         try:
-            await safe_send_message(
+            msg = await safe_send_message(
                 bot,
                 tg,
                 "🛑 <b>Диалог завершён</b>",
@@ -88,6 +101,10 @@ async def finish_dialog(
             continue
         except Exception:
             logger.exception("finish_notify_failed tg=%s", tg)
+            continue
+
+        if msg is not None:
+            await set_ui_message_id(redis, tg, msg.message_id)
 
         await edit_ui(
             bot,
@@ -298,13 +315,28 @@ async def _delete(message: Message) -> None:
         pass
 
 
+NOTICE_TTL_S = 8
+
+
 async def _notice(bot: Bot, redis: Redis, tg_id: int, text: str) -> None:
+    """Transient hint (flood, mute, ban). Self-destructs so the chat stays clean."""
     if not await rate_limit(redis, key=keys.throttle(f"notice:{tg_id}"), ttl_s=20):
         return
     try:
-        await safe_send_message(bot, tg_id, text)
+        msg = await safe_send_message(bot, tg_id, text)
     except Exception:
         logger.info("notice_failed tg=%s", tg_id)
+        return
+    if msg is not None:
+        asyncio.create_task(_delete_later(bot, tg_id, msg.message_id, NOTICE_TTL_S))
+
+
+async def _delete_later(bot: Bot, tg_id: int, message_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await safe_delete_message(bot, tg_id, message_id)
+    except Exception:
+        logger.debug("notice_cleanup_failed tg=%s", tg_id)
 
 
 async def _answer(call: CallbackQuery, text: str | None = None) -> None:

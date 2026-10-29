@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import func, select
 
-from app.database.models import ActiveDialog, Dialog, Gender
+from app.database.models import ActiveDialog, Dialog, Gender, User
 from app.redis import keys
 from app.services.matchmaking import MatchmakingService
 
@@ -184,3 +184,88 @@ async def test_premium_cache_can_be_invalidated(session, redis, settings, make_u
     # …until the payment handler invalidates the cache.
     await svc.invalidate_premium(116)
     assert await svc.is_premium(session, user) is True
+
+
+@pytest.mark.asyncio
+async def test_premium_appearance_mode_prefers_the_most_attractive(session, redis, settings, make_user):
+    from datetime import datetime, timedelta, timezone
+
+    plain = await make_user(120, gender=Gender.female, rating=9.5, ratings_count=20)
+    plain.season_rating_appearance = 2.0
+    plain.appearance_ratings_count = 0
+    beautiful = await make_user(121, gender=Gender.female, rating=6.0, ratings_count=10)
+    beautiful.season_rating_appearance = 9.3
+    beautiful.appearance_ratings_count = 12
+    await session.commit()
+
+    seeker = await make_user(220, gender=Gender.male)
+    svc = MatchmakingService(redis, settings)
+    await svc.set_premium_mode(220, "appearance")
+    await svc.enqueue(session, plain)
+    await svc.enqueue(session, beautiful)
+
+    result = await svc.try_match(session, seeker, premium=True)
+
+    assert result is not None
+    assert result.partner_telegram_id == 121
+
+
+@pytest.mark.asyncio
+async def test_premium_chat_mode_is_the_default(session, redis, settings, make_user):
+    svc = MatchmakingService(redis, settings)
+    assert await svc.premium_mode(999) == "chat"
+    assert await svc.set_premium_mode(999, "appearance") == "appearance"
+    assert await svc.premium_mode(999) == "appearance"
+    assert await svc.set_premium_mode(999, "garbage") == "chat"
+
+
+@pytest.mark.asyncio
+async def test_premium_appearance_falls_back_when_nobody_is_rated(session, redis, settings, make_user):
+    """Honest fallback: never leave a paying user waiting forever."""
+    a = await make_user(122, gender=Gender.female, rating=4.0, ratings_count=3)
+    seeker = await make_user(221, gender=Gender.male)
+    svc = MatchmakingService(redis, settings)
+    await svc.set_premium_mode(221, "appearance")
+    await svc.enqueue(session, a)
+
+    result = await svc.try_match(session, seeker, premium=True)
+
+    assert result is not None
+    assert result.partner_telegram_id == 122
+
+
+@pytest.mark.asyncio
+async def test_match_requires_mutual_consent(session, redis, settings, make_user):
+    """Женщина, ищущая женщин, не должна попадать к мужчине, который ищет женщин."""
+    svc = MatchmakingService(redis, settings)
+    man = await make_user(110, gender=Gender.male)
+    woman = await make_user(210, gender=Gender.female)
+
+    await svc.try_match(session, man, premium=False)
+    # Мужчина ищет женщин; женщина тоже ищет женщин — интересы не совпадают.
+    await redis.set(keys.seek_gender_key(210), "female")
+
+    assert await svc.try_match(session, woman, premium=False) is None
+    assert await _dialog_count(session) == 0
+
+
+@pytest.mark.asyncio
+async def test_premium_user_is_matched_before_waiting_free_user(session, redis, settings, make_user):
+    """Premium даёт приоритет в очереди: его забирают раньше, чем ждущего бесплатного."""
+    from datetime import timedelta
+
+    svc = MatchmakingService(redis, settings)
+    free = await make_user(120, gender=Gender.female)
+    premium = await make_user(220, gender=Gender.female)
+    premium_row = await session.get(User, premium.id)
+    premium_row.subscription_until = datetime.now(tz=UTC) + timedelta(days=5)
+    await session.commit()
+
+    await svc.enqueue(session, free)
+    await svc.enqueue(session, premium)
+
+    seeker = await make_user(320, gender=Gender.male)
+    result = await svc.try_match(session, seeker, premium=False)
+
+    assert result is not None
+    assert result.partner_telegram_id == 220

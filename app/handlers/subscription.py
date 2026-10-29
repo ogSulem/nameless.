@@ -122,6 +122,31 @@ def _offer_text(settings: Settings, until: datetime | None) -> str:
     )
 
 
+@router.callback_query(F.data == "premium:mode")
+async def premium_mode_toggle(
+    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    """Premium users choose what to prioritise: conversation or looks."""
+    tg_id = int(call.from_user.id)
+    user = await get_user(session, tg_id)
+    if user is None or not premium_active(user):
+        await safe_answer_callback(call, "Premium не активен", show_alert=True)
+        return
+
+    matchmaking = MatchmakingService(redis, settings)
+    current = await matchmaking.premium_mode(tg_id)
+    new_mode = "appearance" if current == "chat" else "chat"
+    await matchmaking.set_premium_mode(tg_id, new_mode)
+
+    if new_mode == "appearance":
+        answer = f"Теперь в приоритете собеседники с внешностью {settings.premium_min_appearance:.0f}+"
+    else:
+        answer = f"Теперь в приоритете собеседники с рейтингом общения {settings.premium_min_rating:.0f}+"
+
+    await safe_answer_callback(call, answer, show_alert=True)
+    await show_profile(call.bot, redis, session, settings, tg_id)
+
+
 @router.callback_query(F.data == "pay:premium")
 async def pay_premium(
     call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings, state: FSMContext
@@ -161,8 +186,10 @@ async def payment_email(
 
     if await DialogService(redis, settings).active_dialog_id(session, tg_id):
         await state.clear()
-        await safe_send_message(
-            message.bot, tg_id, "Сначала завершите диалог — затем можно оформить Premium."
+        await edit_ui(
+            message.bot, redis, tg_id,
+            "Сначала завершите диалог — затем можно оформить Premium.",
+            kb=back_kb("menu:profile"),
         )
         return
 
@@ -218,12 +245,12 @@ async def pay_check(
     if state == "paid":
         await MatchmakingService(redis, settings).invalidate_premium(tg_id)
         await safe_answer_callback(call, "✅ Оплата получена, Premium активирован", show_alert=True)
-        await safe_send_message(
-            call.bot, tg_id,
+        await edit_ui(
+            call.bot, redis, tg_id,
             "✅ <b>Оплата получена!</b>\n\n"
             f"Premium активирован до <b>{until:%d.%m.%Y}</b>.\nСпасибо за поддержку 💎",
+            kb=back_kb("menu:profile"),
         )
-        await show_profile(call.bot, redis, session, settings, tg_id)
         return
 
     if state == "canceled":
@@ -257,18 +284,20 @@ async def successful_payment(
     applied, until = await service.complete_telegram_payment(session, message.successful_payment)
 
     if not applied:
-        await safe_send_message(
-            message.bot, int(message.from_user.id),
+        await edit_ui(
+            message.bot, redis, int(message.from_user.id),
             "Платёж получен, но уже был учтён ранее. Если Premium не активировался — напишите в поддержку.",
+            kb=back_kb("menu:profile"),
         )
         return
 
     await MatchmakingService(redis, settings).invalidate_premium(int(message.from_user.id))
     until_text = f"{until:%d.%m.%Y}" if until else "—"
-    await safe_send_message(
-        message.bot, int(message.from_user.id),
+    await edit_ui(
+        message.bot, redis, int(message.from_user.id),
         "✅ <b>Оплата прошла!</b>\n\n"
         f"Premium активирован до <b>{until_text}</b>.\nСпасибо за поддержку 💎",
+        kb=back_kb("menu:profile"),
     )
 
     if settings.alerts_chat_id:
