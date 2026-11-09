@@ -100,9 +100,11 @@ async def show_profile(
     session: AsyncSession,
     settings: Settings,
     tg_id: int,
+    user: User | None = None,
 ) -> None:
-    res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
-    user = res.scalar_one_or_none()
+    if user is None:
+        res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
+        user = res.scalar_one_or_none()
     if user is None:
         await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return

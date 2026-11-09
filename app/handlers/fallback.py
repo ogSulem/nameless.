@@ -43,7 +43,7 @@ async def stale_callback(call: CallbackQuery, session: AsyncSession, redis: Redi
     if await DialogService(redis, settings).active_dialog_id(session, tg_id):
         return
 
-    await show_profile(call.bot, redis, session, settings, tg_id)
+    await show_profile(call.bot, redis, session, settings, tg_id, user=user)
 
 
 @router.message()
