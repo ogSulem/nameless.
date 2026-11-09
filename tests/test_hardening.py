@@ -384,3 +384,33 @@ async def test_ban_closes_the_dialog_of_the_partner(bot, dispatcher, session, re
     dialogs = (await session.execute(select(Dialog))).scalars().all()
     assert all(d.status == DialogStatus.finished for d in dialogs)
     assert "комфортным" in bot.session.live_text(8501), "the partner gets the rating screen"
+
+
+@pytest.mark.asyncio
+async def test_complaint_card_survives_html_in_user_text(bot, dispatcher, session, make_user):
+    """A message containing "<b>" must not break the moderator's card."""
+    from app.database.models import Complaint, Dialog, DialogStatus, Message as DbMessage
+
+    first = await make_user(8601)
+    second = await make_user(8602)
+    dialog = Dialog(user1_id=first.id, user2_id=second.id, status=DialogStatus.finished)
+    session.add(dialog)
+    await session.flush()
+    session.add(
+        DbMessage(dialog_id=dialog.id, from_user_id=second.id, text="привет <b>злой</b> & <script>")
+    )
+    complaint = Complaint(
+        dialog_id=dialog.id,
+        from_user_id=first.id,
+        accused_user_id=second.id,
+        reason="хамит <b>очень</b>",
+        status="open",
+    )
+    session.add(complaint)
+    await session.commit()
+
+    await press(bot, dispatcher, 1, f"adm:complaint:{complaint.id}")  # ADMIN
+
+    text = bot.session.last_text()
+    assert "&lt;b&gt;" in text, "user text must be escaped for parse_mode=HTML"
+    assert "<b>злой</b>" not in text

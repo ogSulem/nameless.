@@ -419,7 +419,8 @@ async def adm_complaint_view(call: CallbackQuery, session: AsyncSession, redis: 
     if detail.messages:
         lines.append("<b>Последние сообщения:</b>")
         for author, text, created in detail.messages[-10:]:
-            lines.append(f"<i>{created:%H:%M}</i> {author}: {text}")
+            # User text must be escaped: a stray "<" used to break the whole card.
+            lines.append(f"<i>{created:%H:%M}</i> {author}: {escape(text)}")
     else:
         lines.append("<i>Сообщения уже удалены по сроку хранения (30 дней).</i>")
     if detail.photos:

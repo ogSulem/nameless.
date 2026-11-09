@@ -157,6 +157,9 @@ async def rate_callback(
         return
 
     step = parts[1]  # chat | app
+    if step not in {"chat", "app"}:
+        await safe_answer_callback(call, "Некорректная оценка")
+        return
     try:
         value = int(parts[2])
     except ValueError:
