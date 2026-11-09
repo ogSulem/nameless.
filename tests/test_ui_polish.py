@@ -179,3 +179,23 @@ async def test_pending_rating_state_is_untouched_by_help(bot, dispatcher, sessio
     screen = bot.session.last_text()
     assert "Профиль" in screen
     assert await redis.get(keys.pending_rating(9114)) is None
+
+
+@pytest.mark.asyncio
+async def test_help_inside_a_dialog_is_html_and_self_deleting(bot, dispatcher, session, make_user):
+    """/help during a chat must not touch the partner card, and it is HTML."""
+    from datetime import date
+
+    from app.database.models import Gender
+
+    for tg, gender in ((9301, Gender.male), (9302, Gender.female)):
+        await make_user(tg, gender=gender, city=None, birth_date=date(1996, 5, 5))
+        await send_text(bot, dispatcher, tg, "/start")
+    await press(bot, dispatcher, 9301, "search:start")
+    await press(bot, dispatcher, 9302, "search:start")
+    live_before = bot.session.live_count(9301)
+
+    await send_text(bot, dispatcher, 9301, "/help")
+    sent = [m for m in bot.session.sent if isinstance(m, SendMessage)]
+    assert sent and sent[-1].parse_mode == "HTML"
+    assert bot.session.live_count(9301) >= live_before, "the partner card must stay"

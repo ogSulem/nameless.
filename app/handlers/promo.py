@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.database.models import User
 from app.flows.states import Promo
+from app.keyboards.start import back_kb
 from app.redis import keys
 from app.services import promo as promo_service
 from app.services.matchmaking import MatchmakingService
@@ -78,6 +79,7 @@ async def _apply(
         await edit_ui(
             bot, redis, tg_id,
             "Слишком много попыток ввода промокода. Попробуйте через час.",
+            kb=back_kb("menu:profile", "← В профиль"),
         )
         return
 
@@ -107,8 +109,6 @@ async def _apply(
             await from_message.delete()
         except Exception:
             pass
-
-    from app.keyboards.start import back_kb
 
     await edit_ui(bot, redis, tg_id, text, kb=back_kb("menu:profile", "← В профиль"))
 

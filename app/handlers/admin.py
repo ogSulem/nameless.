@@ -23,6 +23,7 @@ from app.keyboards.admin import (
     promos_kb,
     user_card_kb,
 )
+from app.redis import keys
 from app.services import admin as service
 from app.telegram_safe import safe_answer_callback, safe_send_message
 from app.ui import edit_ui
@@ -214,6 +215,14 @@ async def _target_user(session: AsyncSession, call: CallbackQuery):
     return user
 
 
+async def _forget_ban_flag(redis: Redis, tg_id: int) -> None:
+    """The ban gate caches the flag; a moderator's decision must apply at once."""
+    try:
+        await redis.delete(keys.ban_flag_key(tg_id))
+    except Exception:
+        pass
+
+
 async def _notify_user(bot: Bot, tg_id: int, text: str) -> None:
     try:
         await safe_send_message(bot, tg_id, text)
@@ -231,6 +240,7 @@ async def adm_ban(call: CallbackQuery, session: AsyncSession, redis: Redis, sett
     result = await service.set_ban(
         session, user, admin_tg=int(call.from_user.id), banned=True, reason="нарушение правил"
     )
+    await _forget_ban_flag(redis, int(user.telegram_id))
     await _stop_activity(call.bot, session, redis, settings, int(user.telegram_id))
     await _notify_user(
         call.bot, int(user.telegram_id),
@@ -267,6 +277,7 @@ async def adm_unban(call: CallbackQuery, session: AsyncSession, redis: Redis, se
     if user is None:
         return
     result = await service.set_ban(session, user, admin_tg=int(call.from_user.id), banned=False)
+    await _forget_ban_flag(redis, int(user.telegram_id))
     await _notify_user(call.bot, int(user.telegram_id), "✅ Блокировка снята. Можно снова искать собеседников.")
     await safe_answer_callback(call, result.text, show_alert=True)
     await _show_user_card(

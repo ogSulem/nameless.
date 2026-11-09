@@ -190,3 +190,52 @@ async def test_delete_user_data_removes_profile(session, make_user):
 
     assert result.ok is True
     assert await admin_service.find_user(session, 610) is None
+
+
+@pytest.mark.asyncio
+async def test_dashboard_is_a_single_query(session, engine, make_user):
+    """The admin menu renders the dashboard on every tap: one statement, not twelve."""
+    from sqlalchemy import event
+
+    await make_user(6101)
+    await make_user(6102, banned=True)
+
+    statements: list[str] = []
+
+    def _count(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _count)
+    try:
+        stats = await admin_service.stats(session)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count)
+
+    assert len(statements) == 1, statements
+    assert stats.users == 2
+    assert stats.banned == 1
+    assert stats.avg_rating >= 0
+
+
+@pytest.mark.asyncio
+async def test_complaint_list_resolves_people_without_n_plus_one(session, engine, make_user):
+    from sqlalchemy import event
+
+    users = [await make_user(6200 + i) for i in range(4)]
+    for i in range(4):
+        await _complaint(session, users[i].id, users[(i + 1) % 4].id, reason=f"r{i}")
+
+    statements: list[str] = []
+
+    def _count(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _count)
+    try:
+        rows = await admin_service.list_complaints(session, page=0, per_page=5)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count)
+
+    assert len(rows) == 4
+    assert len(statements) == 1, statements
+    assert {row.reporter_tg for row in rows} == {6200, 6201, 6202, 6203}

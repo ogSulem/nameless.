@@ -14,6 +14,7 @@ from app.database.models import Dialog
 from app.flows.pending import RATING_TTL_S
 from app.keyboards.dialog_reply import NEXT, STOP
 from app.keyboards.rating import rating_kb
+from app.keyboards.start import back_kb
 from app.redis import keys
 from app.services.dialog import DialogInfo, DialogService
 from app.services.vision import FaceDetector
@@ -158,7 +159,11 @@ async def finish_by_button(message: Message, session: AsyncSession, redis: Redis
     await _delete(message)
 
     if not dialog_id:
-        await edit_ui(message.bot, redis, tg_id, "Сейчас нет активного диалога. Нажмите /start.")
+        await edit_ui(
+            message.bot, redis, tg_id,
+            "Сейчас нет активного диалога.",
+            kb=back_kb("menu:profile", "← В профиль"),
+        )
         return
 
     await finish_dialog(message.bot, session, redis, settings, dialog_id, tg_id, action=action)

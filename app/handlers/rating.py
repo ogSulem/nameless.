@@ -7,22 +7,22 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from redis.asyncio import Redis
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database.models import Rating, RatingType
+from app.database.models import Rating, RatingType, User
 from app.flows.pending import clear_rating
 from app.flows.profile import show_profile
 from app.flows.states import Complaint
-from app.handlers.commands import get_user
 from app.keyboards.rating import complaint_prompt_kb, rating_kb
 from app.keyboards.start import back_kb
 from app.redis import keys
 from app.services.complaint import ComplaintService
 from app.services.rating import RatingService
 from app.telegram_safe import safe_answer_callback
-from app.ui import edit_ui
+from app.ui import edit_ui, notice
 from app.utils.ratelimit import rate_limit
 
 logger = logging.getLogger(__name__)
@@ -87,8 +87,10 @@ async def _save_rating(
     rating_type: RatingType,
     value: int,
 ) -> bool:
-    from_user = await get_user(session, from_tg)
-    to_user = await get_user(session, to_tg)
+    # One statement for both people: a rating tap used to cost two lookups.
+    res = await session.execute(select(User).where(User.telegram_id.in_([from_tg, to_tg])))
+    people = {int(u.telegram_id): u for u in res.scalars()}
+    from_user, to_user = people.get(int(from_tg)), people.get(int(to_tg))
     if from_user is None or to_user is None:
         return False
 
@@ -107,7 +109,9 @@ async def _save_rating(
     )
     session.add(rating)
     try:
-        await session.commit()
+        # Flush, not commit: the duplicate check and the recalculation then share
+        # one transaction and one commit instead of two round trips.
+        await session.flush()
     except IntegrityError:
         await session.rollback()
         logger.info("rating_duplicate dialog_id=%s from=%s type=%s", dialog_id, from_tg, rating_type.value)
@@ -117,7 +121,14 @@ async def _save_rating(
         logger.exception("rating_save_failed dialog_id=%s", dialog_id)
         return False
 
-    update = await service.recalculate(session, to_user.id)
+    try:
+        update = await service.recalculate(session, to_user, commit=False)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        logger.exception("rating_commit_failed dialog_id=%s", dialog_id)
+        return False
+
     logger.info(
         "rating_saved dialog_id=%s from=%s to=%s type=%s value=%s seasonal=%s -> %.2f (n=%s)",
         dialog_id, from_tg, to_tg, rating_type.value, value, anti.is_seasonal_valid,
@@ -176,8 +187,10 @@ async def rate_callback(
 
     state = await _pending(redis, tg_id)
     if not state.get("dialog_id") or not state.get("partner"):
-        await edit_ui(call.bot, redis, tg_id, "Эта оценка уже неактуальна — откройте /start.")
-        await safe_answer_callback(call)
+        # The scale outlived its dialog: put the normal screen back instead of
+        # leaving a dead-end notice where the profile used to be.
+        await show_profile(call.bot, redis, session, settings, tg_id)
+        await safe_answer_callback(call, "Оценка уже сохранена")
         return
 
     # Per step: a quick second tap on the *appearance* scale must not be throttled
@@ -327,7 +340,8 @@ async def complaint_reason(
     await state.clear()
 
     if not dialog_id:
-        await edit_ui(message.bot, redis, tg_id, "Жалоба недоступна: диалог уже закрыт.")
+        await show_profile(message.bot, redis, session, settings, tg_id)
+        await notice(message.bot, redis, tg_id, "Жалоба недоступна: диалог уже закрыт.")
         return
 
     created = await ComplaintService().create(

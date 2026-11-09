@@ -98,10 +98,16 @@ async def _store_seek(
     tg_id: int,
     seek: str,
     fallback_gender: str,
+    user: User | None = None,
 ) -> None:
-    """Persist the preference in the DB (source of truth) and warm the Redis cache."""
+    """Persist the preference in the DB (source of truth) and warm the Redis cache.
+
+    `user` is passed in when the caller already has the row: registration used to
+    read the brand-new account twice in a row.
+    """
     value = _seek_value(seek, fallback_gender)
-    user = await get_user(session, tg_id)
+    if user is None:
+        user = await get_user(session, tg_id)
     if user is not None and user.seek_gender != value:
         user.seek_gender = value
         try:
@@ -169,11 +175,12 @@ async def cmd_start(
             await state.clear()
         dialog_id = await DialogService(redis, settings).active_dialog_id(session, tg_id)
         if dialog_id:
-            await send_new_ui(
+            # The dialog screen is the message that carries the conversation:
+            # replacing it with a hint would delete what the person is reading.
+            await notice(
                 bot, redis, tg_id,
-                "Сейчас у вас идёт диалог.\n\n"
-                "«⏭️ Следующий» — завершить и искать нового собеседника\n"
-                "«🛑 Завершить» — выйти в профиль",
+                "Сейчас у вас идёт диалог — просто напишите сообщение.\n"
+                "<i>«⏭️ Следующий» — другой собеседник, «🛑 Завершить» — в профиль.</i>",
             )
             return
 
@@ -376,19 +383,20 @@ async def reg_seek(
             await session.commit()
         except Exception:
             await session.rollback()
-            if await get_user(session, tg_id) is None:
+            user = await get_user(session, tg_id)
+            if user is None:
                 await send_new_ui(call.bot, redis, tg_id, "Не удалось завершить регистрацию. Попробуйте /start.")
                 await safe_answer_callback(call)
                 return
 
-    await _store_seek(session, redis, tg_id, seek, fallback_gender=gender)
+    await _store_seek(session, redis, tg_id, seek, fallback_gender=gender, user=user)
     await state.clear()
     logger.info("registration_done tg=%s city=%s seek=%s", tg_id, user.city, seek)
 
     if invited_by:
         await _pay_referral(call.bot, redis, session, settings, inviter_tg=invited_by, invitee=user)
 
-    await show_profile(call.bot, redis, session, settings, tg_id)
+    await show_profile(call.bot, redis, session, settings, tg_id, user=user)
     await safe_answer_callback(call, "Готово! Ищем?")
 
 

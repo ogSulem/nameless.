@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import Settings
 from app.database.models import (
@@ -60,58 +61,69 @@ def day_start(now: datetime | None = None) -> datetime:
 
 
 async def stats(session: AsyncSession) -> Stats:
-    today = day_start()
+    """Every number on the dashboard in one round trip.
 
-    async def scalar(stmt) -> int:
-        return int((await session.execute(stmt)).scalar_one() or 0)
+    It used to be a dozen separate COUNTs, and the admin menu renders the
+    dashboard on every tap, so navigating the panel cost twelve queries per
+    button. Scalar subqueries give the same numbers from a single statement and
+    one snapshot.
+    """
+    now = utcnow()
+    today = day_start(now)
+    day_ago = now - timedelta(hours=24)
+    month_ago = now - timedelta(days=30)
 
-    users = await scalar(select(func.count(User.id)).where(User.is_deleted.is_(False)))
-    new_today = await scalar(select(func.count(User.id)).where(User.created_at >= today))
-    active_24h = await scalar(
-        select(func.count(User.id)).where(User.last_seen_at >= utcnow() - timedelta(hours=24))
-    )
-    dialogs_today = await scalar(select(func.count(Dialog.id)).where(Dialog.created_at >= today))
-    dialogs_active = await scalar(
-        select(func.count(Dialog.id)).where(Dialog.status == DialogStatus.active)
-    )
-    messages_today = await scalar(select(func.count(Message.id)).where(Message.created_at >= today))
-    ratings_today = await scalar(select(func.count(Rating.id)).where(Rating.created_at >= today))
-    avg_rating = float(
-        (
-            await session.execute(
-                select(func.avg(User.season_rating_chat)).where(User.chat_ratings_count > 0)
-            )
-        ).scalar_one()
-        or 0.0
-    )
-    premium = await scalar(
-        select(func.count(User.id)).where(User.subscription_until > utcnow())
-    )
-    banned = await scalar(select(func.count(User.id)).where(User.is_banned.is_(True)))
-    complaints_open = await scalar(
-        select(func.count(Complaint.id)).where(Complaint.status == ComplaintStatus.open.value)
-    )
-    revenue = (
+    def one(stmt, name: str):
+        return stmt.scalar_subquery().label(name)
+
+    row = (
         await session.execute(
-            select(func.coalesce(func.sum(Payment.amount), 0)).where(
-                Payment.status == "paid", Payment.paid_at >= utcnow() - timedelta(days=30)
+            select(
+                one(select(func.count(User.id)).where(User.is_deleted.is_(False)), "users"),
+                one(select(func.count(User.id)).where(User.created_at >= today), "new_today"),
+                one(select(func.count(User.id)).where(User.last_seen_at >= day_ago), "active_24h"),
+                one(select(func.count(Dialog.id)).where(Dialog.created_at >= today), "dialogs_today"),
+                one(
+                    select(func.count(Dialog.id)).where(Dialog.status == DialogStatus.active),
+                    "dialogs_active",
+                ),
+                one(select(func.count(Message.id)).where(Message.created_at >= today), "messages_today"),
+                one(select(func.count(Rating.id)).where(Rating.created_at >= today), "ratings_today"),
+                one(
+                    select(func.avg(User.season_rating_chat)).where(User.chat_ratings_count > 0),
+                    "avg_rating",
+                ),
+                one(select(func.count(User.id)).where(User.subscription_until > now), "premium"),
+                one(select(func.count(User.id)).where(User.is_banned.is_(True)), "banned"),
+                one(
+                    select(func.count(Complaint.id)).where(
+                        Complaint.status == ComplaintStatus.open.value
+                    ),
+                    "complaints_open",
+                ),
+                one(
+                    select(func.coalesce(func.sum(Payment.amount), 0)).where(
+                        Payment.status == "paid", Payment.paid_at >= month_ago
+                    ),
+                    "revenue",
+                ),
             )
         )
-    ).scalar_one() or 0
+    ).one()
 
     return Stats(
-        users=users,
-        new_today=new_today,
-        active_24h=active_24h,
-        dialogs_today=dialogs_today,
-        dialogs_active=dialogs_active,
-        messages_today=messages_today,
-        ratings_today=ratings_today,
-        avg_rating=round(avg_rating, 2),
-        premium=premium,
-        banned=banned,
-        complaints_open=complaints_open,
-        revenue_month_rub=round(float(revenue) / 100, 2),
+        users=int(row.users or 0),
+        new_today=int(row.new_today or 0),
+        active_24h=int(row.active_24h or 0),
+        dialogs_today=int(row.dialogs_today or 0),
+        dialogs_active=int(row.dialogs_active or 0),
+        messages_today=int(row.messages_today or 0),
+        ratings_today=int(row.ratings_today or 0),
+        avg_rating=round(float(row.avg_rating or 0.0), 2),
+        premium=int(row.premium or 0),
+        banned=int(row.banned or 0),
+        complaints_open=int(row.complaints_open or 0),
+        revenue_month_rub=round(float(row.revenue or 0) / 100, 2),
     )
 
 
@@ -154,7 +166,6 @@ async def log_action(
         logger.exception("admin_audit_failed action=%s admin=%s", action, admin_tg)
 
 
-# -------------------------------------------------------------------- user card
 @dataclass(frozen=True, slots=True)
 class UserCard:
     user: User
@@ -207,42 +218,34 @@ def age_of(birth) -> int:
 async def user_card(
     session: AsyncSession, user: User, settings: Settings, intent: str = ""
 ) -> UserCard:
-    open_c = int(
-        (
-            await session.execute(
-                select(func.count(Complaint.id)).where(
+    """The moderation card in one statement: four COUNTs became subqueries."""
+    row = (
+        await session.execute(
+            select(
+                select(func.count(Complaint.id))
+                .where(
                     Complaint.accused_user_id == user.id,
                     Complaint.status == ComplaintStatus.open.value,
                 )
-            )
-        ).scalar_one()
-        or 0
-    )
-    total_c = int(
-        (
-            await session.execute(
-                select(func.count(Complaint.id)).where(Complaint.accused_user_id == user.id)
-            )
-        ).scalar_one()
-        or 0
-    )
-    dialogs = int(
-        (
-            await session.execute(
-                select(func.count(Dialog.id)).where(
-                    (Dialog.user1_id == user.id) | (Dialog.user2_id == user.id)
-                )
-            )
-        ).scalar_one()
-        or 0
-    )
-    paid = (
-        await session.execute(
-            select(func.coalesce(func.sum(Payment.amount), 0)).where(
-                Payment.telegram_id == user.telegram_id, Payment.status == "paid"
+                .scalar_subquery()
+                .label("open_c"),
+                select(func.count(Complaint.id))
+                .where(Complaint.accused_user_id == user.id)
+                .scalar_subquery()
+                .label("total_c"),
+                select(func.count(Dialog.id))
+                .where((Dialog.user1_id == user.id) | (Dialog.user2_id == user.id))
+                .scalar_subquery()
+                .label("dialogs"),
+                select(func.coalesce(func.sum(Payment.amount), 0))
+                .where(Payment.telegram_id == user.telegram_id, Payment.status == "paid")
+                .scalar_subquery()
+                .label("paid"),
             )
         )
-    ).scalar_one() or 0
+    ).one()
+    open_c, total_c, dialogs = int(row.open_c or 0), int(row.total_c or 0), int(row.dialogs or 0)
+    paid = row.paid or 0
 
     age = age_of(user.birth_date) if user.birth_date else "?"
     premium_until = _aware(user.subscription_until)
@@ -391,36 +394,41 @@ class ComplaintRow:
 
 
 async def list_complaints(session: AsyncSession, page: int = 0, per_page: int = 5) -> list[ComplaintRow]:
+    """One statement for the whole page.
+
+    Resolving the reporter and the accused used to be a `session.get` per row,
+    which is an N+1 that only stays invisible while the same few people keep
+    reporting each other.
+    """
+    reporter = aliased(User)
+    accused = aliased(User)
     res = await session.execute(
         select(
             Complaint.id,
             Complaint.reason,
             Complaint.created_at,
             Complaint.status,
-            Complaint.from_user_id,
-            Complaint.accused_user_id,
+            reporter.telegram_id,
+            accused.telegram_id,
         )
+        .outerjoin(reporter, reporter.id == Complaint.from_user_id)
+        .outerjoin(accused, accused.id == Complaint.accused_user_id)
         .where(Complaint.status == ComplaintStatus.open.value)
         .order_by(Complaint.created_at.asc())
         .offset(page * per_page)
         .limit(per_page)
     )
-    rows = res.all()
-    out: list[ComplaintRow] = []
-    for cid, reason, created, status, reporter_id, accused_id in rows:
-        reporter = await session.get(User, reporter_id)
-        accused = await session.get(User, accused_id) if accused_id else None
-        out.append(
-            ComplaintRow(
-                id=int(cid),
-                reason=(reason or "")[:60],
-                created_at=created,
-                reporter_tg=int(reporter.telegram_id) if reporter else 0,
-                accused_tg=int(accused.telegram_id) if accused else None,
-                status=str(status.value if hasattr(status, "value") else status),
-            )
+    return [
+        ComplaintRow(
+            id=int(cid),
+            reason=(reason or "")[:60],
+            created_at=created,
+            reporter_tg=int(reporter_tg or 0),
+            accused_tg=int(accused_tg) if accused_tg else None,
+            status=str(status.value if hasattr(status, "value") else status),
         )
-    return out
+        for cid, reason, created, status, reporter_tg, accused_tg in res.all()
+    ]
 
 
 @dataclass(frozen=True, slots=True)

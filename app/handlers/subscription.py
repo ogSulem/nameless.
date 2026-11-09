@@ -17,10 +17,12 @@ from app.flows.states import Payment as PaymentStates
 from app.handlers.commands import get_user
 from app.keyboards.payment import payment_kb
 from app.keyboards.start import back_kb
+from app.redis import keys
 from app.services.matchmaking import MatchmakingService
 from app.services.payments import PaymentError, PaymentService
 from app.telegram_safe import safe_answer_callback, safe_send_message
 from app.ui import edit_ui
+from app.utils.ratelimit import rate_limit
 
 logger = logging.getLogger(__name__)
 router = Router(name="subscription")
@@ -256,6 +258,12 @@ async def pay_check(
     call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
 ) -> None:
     tg_id = int(call.from_user.id)
+    # Each tap is a request to the payment provider: a stuck finger must not
+    # become a burst of API calls.
+    if not await rate_limit(redis, key=keys.rate(f"paycheck:{tg_id}"), ttl_s=3):
+        await safe_answer_callback(call, "Проверяю…")
+        return
+
     service = PaymentService(settings, redis)
 
     if not service.use_yookassa_direct:

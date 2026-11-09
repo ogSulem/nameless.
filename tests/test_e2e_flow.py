@@ -248,3 +248,31 @@ async def test_blocked_partner_is_detected_at_match(bot, dispatcher, session, re
     active = (await session.execute(select(ActiveDialog))).scalars().all()
     assert active == []
     assert "не может получать сообщения" in bot.session.all_text()
+
+
+@pytest.mark.asyncio
+async def test_rating_click_stays_within_one_transaction(bot, dispatcher, session, engine, make_user):
+    """A tap on the 1–10 scale used to cost eleven statements; keep it that low."""
+    from sqlalchemy import event
+
+    await _register(bot, dispatcher, 9101, gender="male")
+    await _register(bot, dispatcher, 9102, gender="female")
+    await press(bot, dispatcher, 9101, "search:start")
+    await press(bot, dispatcher, 9102, "search:start")
+    await send_text(bot, dispatcher, 9101, "\U0001f6d1 Завершить")
+    await session.commit()
+
+    statements: list[str] = []
+
+    def _count(conn, cursor, statement, params, context, executemany):
+        statements.append(" ".join(statement.split())[:60])
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _count)
+    try:
+        await press(bot, dispatcher, 9101, "rate:chat:9")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count)
+
+    stored = (await session.execute(select(Rating))).scalars().all()
+    assert [r.value for r in stored] == [9]
+    assert len(statements) <= 6, statements

@@ -54,46 +54,39 @@ class RatingService:
         from_user_id: int,
         to_user_id: int,
     ) -> AntiAbuseDecision:
+        """Both collusion checks in one round trip.
+
+        They used to be two or three separate COUNTs; as scalar subqueries they
+        cost one statement and see the same snapshot.
+        """
         since = datetime.now(tz=UTC) - timedelta(days=7)
         pair = (from_user_id, to_user_id)
 
-        meets = int(
-            (
-                await session.execute(
-                    select(func.count(Dialog.id))
-                    .where(Dialog.created_at >= since)
-                    .where(and_(Dialog.user1_id.in_(pair), Dialog.user2_id.in_(pair)))
-                )
-            ).scalar_one()
-        )
-        if meets > 3:
-            return AntiAbuseDecision(False, "pair_met_too_often")
-
-        mutual = int(
-            (
-                await session.execute(
-                    select(func.count(Rating.id))
-                    .where(Rating.created_at >= since)
-                    .where(Rating.rating_type == RatingType.chat)
-                    .where(and_(Rating.from_user_id.in_(pair), Rating.to_user_id.in_(pair)))
-                )
-            ).scalar_one()
-        )
-        if mutual >= 10:
-            high = int(
-                (
-                    await session.execute(
-                        select(func.count(Rating.id))
-                        .where(Rating.created_at >= since)
-                        .where(Rating.rating_type == RatingType.chat)
-                        .where(Rating.value >= 9)
-                        .where(and_(Rating.from_user_id.in_(pair), Rating.to_user_id.in_(pair)))
-                    )
-                ).scalar_one()
+        def _ratings(*extra):
+            return (
+                select(func.count(Rating.id))
+                .where(Rating.created_at >= since)
+                .where(Rating.rating_type == RatingType.chat)
+                .where(and_(Rating.from_user_id.in_(pair), Rating.to_user_id.in_(pair)))
+                .where(*extra)
+                .scalar_subquery()
             )
-            if high / mutual >= 0.8:
-                return AntiAbuseDecision(False, "mutual_high_ratio")
 
+        met = (
+            select(func.count(Dialog.id))
+            .where(Dialog.created_at >= since)
+            .where(and_(Dialog.user1_id.in_(pair), Dialog.user2_id.in_(pair)))
+            .scalar_subquery()
+        )
+        mutual, high = _ratings(), _ratings(Rating.value >= 9)
+        met_count, mutual_count, high_count = (
+            int(v or 0) for v in (await session.execute(select(met, mutual, high))).one()
+        )
+
+        if met_count > 3:
+            return AntiAbuseDecision(False, "pair_met_too_often")
+        if mutual_count >= 10 and high_count / mutual_count >= 0.8:
+            return AntiAbuseDecision(False, "mutual_high_ratio")
         return AntiAbuseDecision(True, None)
 
     # ------------------------------------------------------------ aggregation
@@ -106,20 +99,17 @@ class RatingService:
         total = float(sum(values)) + prior_mean * prior_weight
         return round(total / (len(values) + prior_weight), 2)
 
-    async def recalculate(self, session: AsyncSession, to_user_id: int) -> RatingUpdate:
-        user = await session.get(User, to_user_id)
+    async def recalculate(
+        self, session: AsyncSession, to_user_id: int | User, *, commit: bool = True
+    ) -> RatingUpdate:
+        user = to_user_id if isinstance(to_user_id, User) else await session.get(User, to_user_id)
         if user is None:
             return RatingUpdate(False, 0.0, 0.0, 0.0, 0, 0, False)
 
         previous_chat = float(user.season_rating_chat or 0.0)
         window = max(1, int(self._settings.rating_window))
 
-        # Only the window is needed for the maths. Reading the whole rating history
-        # of a long-lived user on every new rating does not scale past a few months.
-        chat_window = await _recent_values(session, to_user_id, RatingType.chat, window)
-        app_window = await _recent_values(session, to_user_id, RatingType.appearance, window)
-        chat_total = await _count(session, to_user_id, RatingType.chat)
-        app_total = await _count(session, to_user_id, RatingType.appearance)
+        chat_window, chat_total, app_window, app_total = await _windows(session, int(user.id), window)
 
         user.chat_ratings_count = chat_total
         user.appearance_ratings_count = app_total
@@ -133,16 +123,17 @@ class RatingService:
             if previous_chat - user.season_rating_chat >= 3:
                 user.is_under_review = True
 
-        try:
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            logger.exception("rating_recalculate_commit_failed user_id=%s", to_user_id)
-            raise
+        if commit:
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception("rating_recalculate_commit_failed user_id=%s", user.id)
+                raise
 
         logger.info(
             "rating_recalculated user_id=%s chat=%s (n=%s) appearance=%s (n=%s)",
-            to_user_id, user.season_rating_chat, user.chat_ratings_count,
+            user.id, user.season_rating_chat, user.chat_ratings_count,
             user.season_rating_appearance, user.appearance_ratings_count,
         )
         return RatingUpdate(
@@ -156,32 +147,45 @@ class RatingService:
         )
 
 
-async def _recent_values(
-    session: AsyncSession, to_user_id: int, rating_type: RatingType, limit: int
-) -> list[int]:
-    """Newest `limit` valid ratings, returned oldest-first for the rolling maths."""
-    res = await session.execute(
-        select(Rating.value)
-        .where(
-            Rating.to_user_id == to_user_id,
-            Rating.rating_type == rating_type,
-            Rating.is_seasonal_valid.is_(True),
-        )
-        .order_by(Rating.created_at.desc(), Rating.id.desc())
-        .limit(max(1, int(limit)))
-    )
-    return [int(v) for v in res.scalars().all()][::-1]
+async def _windows(
+    session: AsyncSession, to_user_id: int, window: int
+) -> tuple[list[int], int, list[int], int]:
+    """Both rating windows *and* both totals in a single statement.
 
-
-async def _count(session: AsyncSession, to_user_id: int, rating_type: RatingType) -> int:
-    res = await session.execute(
-        select(func.count(Rating.id)).where(
-            Rating.to_user_id == to_user_id,
-            Rating.rating_type == rating_type,
-            Rating.is_seasonal_valid.is_(True),
-        )
+    Only the newest `window` rows feed the maths (a long-lived user's full
+    history does not scale), but the totals still need every row, so they come
+    back as a window function over the same scan.
+    """
+    rn = func.row_number().over(
+        partition_by=Rating.rating_type,
+        order_by=(Rating.created_at.desc(), Rating.id.desc()),
     )
-    return int(res.scalar_one() or 0)
+    total = func.count().over(partition_by=Rating.rating_type)
+    inner = (
+        select(Rating.rating_type, Rating.value, rn.label("rn"), total.label("total"))
+        .where(Rating.to_user_id == to_user_id, Rating.is_seasonal_valid.is_(True))
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(inner.c.rating_type, inner.c.value, inner.c.total)
+            .where(inner.c.rn <= max(1, int(window)))
+            .order_by(inner.c.rating_type, inner.c.rn.desc())
+        )
+    ).all()
+
+    chat: list[int] = []
+    app: list[int] = []
+    chat_total = app_total = 0
+    for rating_type, value, count in rows:
+        kind = rating_type.value if hasattr(rating_type, "value") else rating_type
+        if kind == RatingType.chat.value:
+            chat.append(int(value))
+            chat_total = int(count)
+        else:
+            app.append(int(value))
+            app_total = int(count)
+    return chat, chat_total, app, app_total
 
 
 def _mean(values: list[int]) -> float:

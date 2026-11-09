@@ -29,6 +29,11 @@ def online_key(tg_id: int) -> str:
     return f"online:{tg_id}"
 
 
+def ban_flag_key(tg_id: int) -> str:
+    """Short-lived copy of `users.is_banned`: the ban gate runs on *every* update."""
+    return f"ban:{tg_id}"
+
+
 def seen_key(tg_id: int) -> str:
     """Throttles the `last_seen_at` UPDATE to once per few minutes."""
     return f"seen:{tg_id}"

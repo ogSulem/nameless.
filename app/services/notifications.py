@@ -67,12 +67,18 @@ async def announce_match(
     for me, partner in ((first, second), (second, first)):
         tg = int(me.telegram_id)
         try:
-            search_mid = await _pop_int(redis, keys.ui_search_message_id(tg))
-            if search_mid:
-                await safe_delete_message(bot, tg, search_mid)
-            ui_mid = await _pop_int(redis, keys.ui_message_id(tg))
-            if ui_mid:
-                await safe_delete_message(bot, tg, ui_mid)
+            # The search screen usually *is* the current screen: deleting the same
+            # message twice is one wasted API call per match.
+            mids = {
+                mid
+                for mid in (
+                    await _pop_int(redis, keys.ui_search_message_id(tg)),
+                    await _pop_int(redis, keys.ui_message_id(tg)),
+                )
+                if mid
+            }
+            for mid in mids:
+                await safe_delete_message(bot, tg, mid)
         except Exception:
             logger.warning("announce_cleanup_failed tg=%s", tg, exc_info=True)
 
@@ -132,11 +138,16 @@ async def _abort_match(
 
 
 async def _pop_int(redis: Redis, key: str) -> int | None:
+    """Read-and-delete in a single round trip (GETDEL), with a plain fallback."""
     try:
-        raw = await redis.get(key)
-        await redis.delete(key)
+        raw = await redis.getdel(key)
     except Exception:
-        return None
+        # Redis older than 6.2 (or a proxy without GETDEL): two calls will do.
+        try:
+            raw = await redis.get(key)
+            await redis.delete(key)
+        except Exception:
+            return None
     if raw is None:
         return None
     try:

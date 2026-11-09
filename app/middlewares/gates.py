@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.database.models import User
+from app.redis import keys
 from app.telegram_safe import safe_send_message
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 # Even a banned user keeps the legally required escape hatches: read the policy,
 # read the terms, and erase their data.
 ALLOWED_FOR_BANNED = {"start", "help", "privacy", "terms", "delete_me"}
+
+# Short enough that a manual edit in the database still takes effect quickly.
+BAN_CACHE_TTL_S = 60
 
 BAN_TEXT = (
     "<b>⛔ Доступ ограничен</b>\n\n"
@@ -72,15 +76,13 @@ class BanGateMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         session: AsyncSession | None = data.get("session")
+        redis: Redis | None = data.get("redis")
         owns_session = session is None
         if session is None:
             session = self._session_factory()
 
         try:
-            user = (
-                await session.execute(select(User).where(User.telegram_id == tg_id))
-            ).scalar_one_or_none()
-            if user is None or not user.is_banned:
+            if not await self._is_banned(tg_id, session, redis):
                 return await handler(event, data)
 
             await self._refuse(event, data.get("redis"))
@@ -89,6 +91,32 @@ class BanGateMiddleware(BaseMiddleware):
         finally:
             if owns_session:
                 await session.close()
+
+    async def _is_banned(self, tg_id: int, session: AsyncSession, redis: Redis | None) -> bool:
+        """A ban is rare and changes rarely: read it from Redis, not from Postgres.
+
+        This runs on every single update, so a database round trip here used to
+        cost one extra query per message for every user in every dialog.
+        """
+        if redis is not None:
+            try:
+                cached = await redis.get(keys.ban_flag_key(tg_id))
+            except Exception:
+                cached = None
+            if cached is not None:
+                return cached in ("1", b"1")
+
+        user = (
+            await session.execute(select(User).where(User.telegram_id == tg_id))
+        ).scalar_one_or_none()
+        banned = bool(user is not None and user.is_banned)
+
+        if redis is not None:
+            try:
+                await redis.set(keys.ban_flag_key(tg_id), "1" if banned else "0", ex=BAN_CACHE_TTL_S)
+            except Exception:
+                pass
+        return banned
 
     async def _refuse(self, event: Update, redis: Redis | None) -> None:
         cb: CallbackQuery | None = event.callback_query

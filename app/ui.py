@@ -49,7 +49,8 @@ async def notice(
     if not fresh:
         return
     try:
-        msg = await safe_send_message(bot, tg_id, text)
+        # Same markup as every screen: /help and the rules are HTML.
+        msg = await safe_send_message(bot, tg_id, text, parse_mode=PARSE_MODE)
     except Exception:
         logger.info("notice_failed tg=%s", tg_id)
         return

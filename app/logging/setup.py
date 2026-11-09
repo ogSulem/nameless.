@@ -7,23 +7,58 @@ from logging.handlers import TimedRotatingFileHandler
 from app.logging.context import UpdateIdFilter
 
 
-class SecretMaskingFilter(logging.Filter):
-    def __init__(self, secrets: list[str] | None = None):
-        super().__init__()
+class _Masker:
+    """Shared masking rules for tokens, DSN passwords and configured secrets."""
+
+    _TOKEN_RE = re.compile(r"([0-9]{8,12}:[a-zA-Z0-9_-]{20,})")
+    _DSN_RE = re.compile(r":([^@/]+)@([^/]+):(\d+)")
+
+    def __init__(self, secrets: list[str] | None = None) -> None:
         self._secrets = [s for s in (secrets or []) if s and len(s) > 4]
 
+    def mask(self, text: str) -> str:
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, "*" * 8)
+        text = self._TOKEN_RE.sub("TOKEN_MASKED", text)
+        return self._DSN_RE.sub(r":***@\2:\3", text)
+
+
+class SecretMaskingFilter(logging.Filter):
+    """Mask secrets that arrive as `%s` arguments.
+
+    Values interpolated at format time never pass through `record.msg`, so
+    `logger.info("token=%s", token)` used to slip past the mask. The message
+    template itself is left alone — rewriting it would eat its placeholders —
+    and the finished line is masked by `MaskingFormatter`.
+    """
+
+    def __init__(self, secrets: list[str] | None = None):
+        super().__init__()
+        self._masker = _Masker(secrets)
+
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = str(record.msg)
-        for s in self._secrets:
-            if s in msg:
-                msg = msg.replace(s, "*" * 8)
-
-        # Also mask common patterns like bot tokens or passwords in DSNs
-        msg = re.sub(r"([0-9]{8,12}:[a-zA-Z0-9_-]{20,})", "TOKEN_MASKED", msg)
-        msg = re.sub(r":([^@/]+)@([^/]+):(\d+)", r":***@\2:\3", msg) # DSN password
-
-        record.msg = msg
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._masker.mask(arg) if isinstance(arg, str) else arg for arg in record.args
+            )
+        elif isinstance(record.args, dict):
+            record.args = {
+                key: self._masker.mask(value) if isinstance(value, str) else value
+                for key, value in record.args.items()
+            }
         return True
+
+
+class MaskingFormatter(logging.Formatter):
+    """Mask secrets in the fully rendered line (f-strings, exception text, ...)."""
+
+    def __init__(self, *args, secrets: list[str] | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._masker = _Masker(secrets)
+
+    def format(self, record: logging.LogRecord) -> str:
+        return self._masker.mask(super().format(record))
 
 
 def setup_logging(log_level: str) -> Logger:
@@ -40,9 +75,10 @@ def setup_logging(log_level: str) -> Logger:
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
-    fmt = logging.Formatter(
+    fmt = MaskingFormatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | upd=%(update_id)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        secrets=secrets_to_mask,
     )
 
     upd_filt = UpdateIdFilter()
