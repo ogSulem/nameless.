@@ -26,7 +26,7 @@ class UserBlockedBot(Exception):
 # on slow mobile clients. Remembering what each message already shows turns a
 # repeated tap into a no-op.
 _RENDERED: OrderedDict[tuple[int, int], tuple[str, str]] = OrderedDict()
-_RENDERED_MAX = 4096
+_RENDERED_MAX = 1024
 
 
 def _markup_key(markup: Any | None) -> str:
