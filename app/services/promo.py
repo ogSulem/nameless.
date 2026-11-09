@@ -192,21 +192,24 @@ async def redeem(session: AsyncSession, *, telegram_id: int, raw_code: str) -> R
         await session.rollback()
         return RedeemResult(RedeemStatus.exhausted, code=code)
 
-    session.add(
-        PromoRedemption(code_id=promo.id, telegram_id=int(telegram_id), days=promo.days)
-    )
+    # Read everything needed off the ORM object *before* any rollback: after one
+    # the instance is expired and touching an attribute would need IO in a sync
+    # context (MissingGreenlet on async drivers).
+    days = int(promo.days)
+    code_id = int(promo.id)
+    session.add(PromoRedemption(code_id=code_id, telegram_id=int(telegram_id), days=days))
     try:
         await session.flush()
     except IntegrityError:
         # Lost a race against the same person's parallel tap: undo the counter.
         await session.rollback()
-        return RedeemResult(RedeemStatus.already_used, code=code, days=promo.days)
+        return RedeemResult(RedeemStatus.already_used, code=code, days=days)
 
     until = await SubscriptionService().extend_subscription(
-        session=session, telegram_id=int(telegram_id), days=promo.days
+        session=session, telegram_id=int(telegram_id), days=days
     )
-    logger.info("promo_redeemed code=%s tg=%s days=%s", code, telegram_id, promo.days)
-    return RedeemResult(RedeemStatus.ok, code=code, days=promo.days, until=until)
+    logger.info("promo_redeemed code=%s tg=%s days=%s", code, telegram_id, days)
+    return RedeemResult(RedeemStatus.ok, code=code, days=days, until=until)
 
 
 async def list_codes(session: AsyncSession, limit: int = 10) -> list[PromoRow]:

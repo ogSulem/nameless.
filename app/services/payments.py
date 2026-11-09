@@ -231,7 +231,11 @@ class PaymentService:
         try:
             await session.commit()
         except IntegrityError:
+            # Without the row the webhook cannot credit anybody, and the user would
+            # be holding a link we cannot fulfil. Fail loudly instead.
             await session.rollback()
+            logger.error("yookassa_row_failed tg=%s id=%s", user.telegram_id, payment_id)
+            raise PaymentError("payment_not_stored") from None
 
         await self._remember_pending(int(user.telegram_id), payment_id)
         return PaymentInit(url=url, payment_id=payment_id, provider="yookassa")
