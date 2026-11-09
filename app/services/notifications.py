@@ -30,18 +30,17 @@ def partner_card(partner: User) -> str:
         if int(partner.appearance_ratings_count or 0) > 0:
             rating += f" · внешность: {float(partner.season_rating_appearance or 0):.1f}/10"
 
-    return "\n".join(
-        [
-            "🔗 <b>Собеседник найден</b>",
-            "",
-            f"{gender}, {age_of(partner.birth_date)}",
-            f"🏙 {city}",
-            rating,
-            ("💎 Premium" if premium_active(partner) else ""),
-            "",
-            "<i>Собеседник не видит ваш профиль. Правила: без оскорблений и личных данных.</i>",
-        ]
-    ).replace("\n\n\n", "\n\n")
+    lines = [
+        "🔗 <b>Собеседник найден</b>",
+        "",
+        f"{gender}, {age_of(partner.birth_date)}",
+        f"🏙 {city}",
+        rating,
+    ]
+    if premium_active(partner):
+        lines.append("💎 Premium")
+    lines += ["", "<i>Собеседник не видит ваш профиль. Правила: без оскорблений и личных данных.</i>"]
+    return "\n".join(lines)
 
 
 async def announce_match(

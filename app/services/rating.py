@@ -123,7 +123,6 @@ class RatingService:
 
         user.chat_ratings_count = chat_total
         user.appearance_ratings_count = app_total
-        user.calibration_counter = chat_total
 
         user.season_rating_chat = self.blended(chat_window)
         user.season_rating_appearance = self.blended(app_window)

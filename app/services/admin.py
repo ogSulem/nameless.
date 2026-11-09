@@ -247,7 +247,7 @@ async def user_card(
         f"⭐ Рейтинг: <b>{user.season_rating_chat:.2f}</b> "
         f"({user.chat_ratings_count} оценок, {user.last_20_avg_chat:.2f} за 20)",
         f"🖼 Внешность: <b>{user.season_rating_appearance:.2f}</b> "
-        f"({user.appearance_ratings_count} оценок)",
+        f"({user.appearance_ratings_count} оценок, {user.last_20_avg_appearance:.2f} за 20)",
         "",
         f"📅 Регистрация: {user.created_at:%d.%m.%Y}" if user.created_at else "📅 —",
         f"👀 Был(а): {last_seen:%d.%m %H:%M} UTC" if last_seen else "👀 —",
@@ -324,6 +324,9 @@ async def reset_rating(session: AsyncSession, user: User, *, admin_tg: int) -> A
     user.last_20_avg_appearance = 0.0
     user.chat_ratings_count = 0
     user.appearance_ratings_count = 0
+    # The flag was set by the drop that is being erased, and nothing else could
+    # ever clear it — the user stayed locked out of promos for good.
+    user.is_under_review = False
     await session.commit()
     await log_action(session, admin_tg=admin_tg, action="reset_rating", target_tg=int(user.telegram_id))
     return ActionResult(True, f"Рейтинг сброшен: {user.telegram_id}")

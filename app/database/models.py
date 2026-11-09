@@ -46,9 +46,6 @@ class User(Base):
     # NULL (legacy rows) means "the opposite gender".
     seek_gender: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
-    rating_chat: Mapped[float] = mapped_column(Float, nullable=False, server_default="5.0")
-    rating_appearance: Mapped[float | None] = mapped_column(Float, nullable=True)
-
     last_20_avg_chat: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
     last_20_avg_appearance: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
 
@@ -57,8 +54,6 @@ class User(Base):
 
     chat_ratings_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     appearance_ratings_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-
-    calibration_counter: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     subscription_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_under_review: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
