@@ -101,9 +101,5 @@ class ComplaintService:
             except Exception:
                 logger.warning("complaint_notify_failed target=%s", target, exc_info=True)
 
-        # Fallback: last complaint is always visible in the admin panel, so a
-        # failed notification never means a lost report.
-        try:
-            await redis.set("mod:last_complaint", str(created.complaint_id), ex=60 * 60 * 24 * 7)
-        except Exception:
-            pass
+        # Fallback: the complaint is always in the admin panel, so a failed
+        # notification never means a lost report.

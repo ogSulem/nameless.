@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     # --- Service ------------------------------------------------------------
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     port: int = Field(default=8080, alias="PORT")
-    media_root: str = Field(default="/app/media", alias="MEDIA_ROOT")
 
     # --- Matching / dialogs -------------------------------------------------
     online_ttl_s: int = Field(default=900, alias="ONLINE_TTL_S")

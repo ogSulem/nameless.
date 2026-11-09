@@ -41,6 +41,11 @@ class User(Base):
     birth_date: Mapped[date] = mapped_column(Date, nullable=False)
     city: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
+    # Whom the user is looking for: male / female / any. Kept in the DB, not only
+    # in Redis: a flushed cache must not silently change whom a person is shown.
+    # NULL (legacy rows) means "the opposite gender".
+    seek_gender: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
     rating_chat: Mapped[float] = mapped_column(Float, nullable=False, server_default="5.0")
     rating_appearance: Mapped[float | None] = mapped_column(Float, nullable=True)
 

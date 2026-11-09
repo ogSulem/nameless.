@@ -9,20 +9,21 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from redis.asyncio import Redis
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database.models import ActiveDialog, Gender, User
-from app.flows.profile import age_of, invalidate_profile, show_profile
+from app.database.models import Gender, User
+from app.flows.profile import age_of, show_profile
 from app.flows.states import ProfileEdit, Registration
 from app.keyboards.profile import delete_confirm_kb, legal_kb
 from app.keyboards.start import back_kb, city_kb, consent_kb, gender_kb, seek_gender_kb
 from app.redis import keys
+from app.services import account
 from app.services import admin as admin_service
 from app.services.city_validator import sanitize_city
 from app.services.dialog import DialogService
-from app.services.matchmaking import MatchmakingService
+from app.services.matchmaking import MatchmakingService, seek_gender_for
 from app.telegram_safe import safe_answer_callback, safe_send_message
 from app.texts import days_label, help_text, privacy_text, rules_text, terms_text
 from app.ui import edit_ui, send_new_ui
@@ -49,54 +50,20 @@ def parse_birth_date(raw: str) -> date | None:
 
 async def caretaker_purge(bot: Bot, session: AsyncSession, redis: Redis, settings: Settings, tg_id: int) -> None:
     """Delete every trace of a user (152-ФЗ right to erasure)."""
-    svc = DialogService(redis, settings)
-    dialog_id = await svc.active_dialog_id(session, tg_id)
-    if dialog_id:
-        tgs = await svc.finish(session, dialog_id, actor_tg_id=tg_id)
-        for other in tgs or []:
-            if other != tg_id:
-                try:
-                    # Replaces the partner card: the chat keeps a single screen.
-                    await send_new_ui(
-                        bot,
-                        redis,
-                        other,
-                        "Диалог завершён: собеседник удалил профиль.\n\n"
-                        "Нажмите /start, чтобы найти нового.",
-                        kb=back_kb("search:start", "🔎 Найти собеседника"),
-                    )
-                except Exception:
-                    logger.info("purge_notify_failed tg=%s", other)
-
-    user = await get_user(session, tg_id)
-    if user is not None:
-        await session.execute(delete(ActiveDialog).where(ActiveDialog.user_id == user.id))
-        await session.delete(user)  # cascades to dialogs/messages/photos/ratings/complaints
-        await session.commit()
-
-    try:
-        pipe = redis.pipeline(transaction=False)
-        for key in (
-            keys.profile_text(tg_id),
-            keys.ui_message_id(tg_id),
-            keys.ui_rating_message_id(tg_id),
-            keys.ui_search_message_id(tg_id),
-            keys.active_dialog(tg_id),
-            keys.pending_rating(tg_id),
-            keys.pending_rating_partner(tg_id),
-            keys.pending_rating_step(tg_id),
-            keys.pending_rating_has_photos(tg_id),
-            keys.pending_rating_action(tg_id),
-            keys.queue_member_key(tg_id),
-            keys.seek_gender_key(tg_id),
-            keys.user_id_by_tg(tg_id),
-            keys.user_rating_chat_by_tg(tg_id),
-            keys.online_key(tg_id),
-        ):
-            pipe.delete(key)
-        await pipe.execute()
-    except Exception:
-        logger.warning("purge_redis_failed tg=%s", tg_id, exc_info=True)
+    partners = await account.purge_user(session, redis, settings, tg_id)
+    for other in partners:
+        try:
+            # Replaces the partner card: the chat keeps a single screen.
+            await send_new_ui(
+                bot,
+                redis,
+                other,
+                "Диалог завершён: собеседник удалил профиль.\n\n"
+                "Нажмите /start, чтобы найти нового.",
+                kb=back_kb("search:start", "🔎 Найти собеседника"),
+            )
+        except Exception:
+            logger.info("purge_notify_failed tg=%s", other)
 
     await admin_service.log_action(session, admin_tg=0, action="user_self_deleted", target_tg=tg_id)
     logger.info("user_deleted tg=%s", tg_id)
@@ -109,15 +76,45 @@ async def _delete(message: Message) -> None:
         pass
 
 
-async def _store_seek(redis: Redis, tg_id: int, seek: str, fallback_gender: str) -> None:
-    value = seek if seek in {"male", "female"} else ("female" if fallback_gender == "male" else "male")
+def _seek_value(seek: str, fallback_gender: str) -> str:
+    """`any` is stored as itself; anything unexpected falls back to the opposite gender."""
+    return seek if seek in {"male", "female", "any"} else seek_gender_for(fallback_gender)
+
+
+async def _store_seek(
+    session: AsyncSession,
+    redis: Redis,
+    tg_id: int,
+    seek: str,
+    fallback_gender: str,
+) -> None:
+    """Persist the preference in the DB (source of truth) and warm the Redis cache."""
+    value = _seek_value(seek, fallback_gender)
+    user = await get_user(session, tg_id)
+    if user is not None and user.seek_gender != value:
+        user.seek_gender = value
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.warning("store_seek_db_failed tg=%s", tg_id, exc_info=True)
     try:
         pipe = redis.pipeline(transaction=False)
         pipe.set(keys.seek_gender_key(tg_id), value, ex=60 * 60 * 24 * 365)
-        pipe.set(f"seek:display:{tg_id}", seek, ex=60 * 60 * 24 * 365)
+        pipe.set(keys.seek_display_key(tg_id), value, ex=60 * 60 * 24 * 365)
         await pipe.execute()
     except Exception:
-        logger.warning("store_seek_failed tg=%s", tg_id, exc_info=True)
+        logger.warning("store_seek_redis_failed tg=%s", tg_id, exc_info=True)
+
+
+def _consent_text(settings: Settings) -> str:
+    return (
+        "<b>Добро пожаловать в Nameless</b> 💎\n\n"
+        "Анонимный чат: собеседник не видит ваш профиль и контакты.\n\n"
+        f"{rules_text()}\n\n"
+        f"<i>Нажимая кнопку ниже, вы подтверждаете, что вам {settings.min_age}+, и принимаете "
+        "условия и политику обработки данных.</i>"
+    )
 
 
 # ---------------------------------------------------------------------- start
@@ -178,17 +175,7 @@ async def cmd_start(
     if inviter is not None:
         # Written *after* clear(), otherwise the invite payload is wiped.
         await state.update_data(invited_by=inviter)
-    await send_new_ui(
-        bot,
-        redis,
-        tg_id,
-        "<b>Добро пожаловать в Nameless</b> 💎\n\n"
-        "Анонимный чат: собеседник не видит ваш профиль и контакты.\n\n"
-        f"{rules_text()}\n\n"
-        f"<i>Нажимая кнопку ниже, вы подтверждаете, что вам {settings.min_age}+, и принимаете "
-        "условия и политику обработки данных.</i>",
-        kb=consent_kb(),
-    )
+    await send_new_ui(bot, redis, tg_id, _consent_text(settings), kb=consent_kb())
     logger.info("registration_start tg=%s", tg_id)
 
 
@@ -210,6 +197,22 @@ async def consent_accept(
     )
     await state.set_state(Registration.gender)
     await edit_ui(call.bot, redis, tg_id, "<b>Шаг 1 из 4.</b> Ваш пол:", kb=gender_kb())
+    await safe_answer_callback(call)
+
+
+@router.callback_query(Registration.consent, F.data == "consent:back")
+async def consent_back(
+    call: CallbackQuery, state: FSMContext, redis: Redis, session: AsyncSession, settings: Settings
+) -> None:
+    """Legal documents are opened from the consent screen; they must lead back to it."""
+    tg_id = int(call.from_user.id)
+    if await get_user(session, tg_id) is not None:
+        await state.clear()
+        await show_profile(call.bot, redis, session, settings, tg_id)
+        await safe_answer_callback(call)
+        return
+    await state.set_state(Registration.consent)
+    await edit_ui(call.bot, redis, tg_id, _consent_text(settings), kb=consent_kb())
     await safe_answer_callback(call)
 
 
@@ -352,6 +355,7 @@ async def reg_seek(
             gender=Gender(gender),
             birth_date=birth_date,
             city=data.get("city"),
+            seek_gender=_seek_value(seek, gender),
             consent_at=datetime.fromisoformat(consent_at) if consent_at else datetime.now(tz=UTC),
             consent_version=str(consent_version),
             last_seen_at=datetime.now(tz=UTC),
@@ -367,7 +371,7 @@ async def reg_seek(
                 await safe_answer_callback(call)
                 return
 
-    await _store_seek(redis, tg_id, seek, fallback_gender=gender)
+    await _store_seek(session, redis, tg_id, seek, fallback_gender=gender)
     await state.clear()
     logger.info("registration_done tg=%s city=%s seek=%s", tg_id, user.city, seek)
 
@@ -403,17 +407,23 @@ async def menu_legal(call: CallbackQuery, redis: Redis) -> None:
 
 
 @router.callback_query(F.data.startswith("legal:"))
-async def legal_docs(call: CallbackQuery, redis: Redis, settings: Settings) -> None:
+async def legal_docs(
+    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
     what = call.data.rsplit(":", 1)[-1]
-    if what == "terms":
-        await edit_ui(call.bot, redis, int(call.from_user.id), terms_text(settings),
-                      kb=back_kb("menu:legal", "← Назад"))
-    elif what == "privacy":
-        await edit_ui(call.bot, redis, int(call.from_user.id), privacy_text(settings),
-                      kb=back_kb("menu:legal", "← Назад"))
-    else:
+    if what not in {"terms", "privacy"}:
         await safe_answer_callback(call)
         return
+
+    tg_id = int(call.from_user.id)
+    # Before registration there is no profile to go back to — return to consent.
+    back = (
+        back_kb("menu:legal", "← Назад")
+        if await get_user(session, tg_id) is not None
+        else back_kb("consent:back", "← К регистрации")
+    )
+    text = terms_text(settings) if what == "terms" else privacy_text(settings)
+    await edit_ui(call.bot, redis, tg_id, text, kb=back)
     await safe_answer_callback(call)
 
 
@@ -675,7 +685,6 @@ async def _save_city(
     # The queue holds the old city; re-queueing under the new one avoids ghost matches.
     svc = MatchmakingService(redis, settings)
     await svc.dequeue(tg_id)
-    await invalidate_profile(redis, tg_id)
     await show_profile(bot, redis, session, settings, tg_id, new_message=call is None)
 
 
@@ -706,7 +715,9 @@ async def edit_seek_choice(
         await safe_answer_callback(call, "Профиль не найден")
         return
 
-    await _store_seek(redis, tg_id, seek, fallback_gender=getattr(user.gender, "value", user.gender))
+    await _store_seek(
+        session, redis, tg_id, seek, fallback_gender=getattr(user.gender, "value", user.gender)
+    )
     await state.clear()
     await MatchmakingService(redis, settings).dequeue(tg_id)
     await show_profile(call.bot, redis, session, settings, tg_id)

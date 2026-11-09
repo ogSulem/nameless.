@@ -114,33 +114,23 @@ class RatingService:
         previous_chat = float(user.season_rating_chat or 0.0)
         window = max(1, int(self._settings.rating_window))
 
-        res = await session.execute(
-            select(Rating.rating_type, Rating.value, Rating.created_at)
-            .where(Rating.to_user_id == to_user_id)
-            .where(Rating.is_seasonal_valid.is_(True))
-            .order_by(Rating.created_at.asc())
-        )
-        chat_values: list[int] = []
-        app_values: list[int] = []
-        for rating_type, value, _created in res.all():
-            if rating_type == RatingType.chat:
-                chat_values.append(int(value))
-            else:
-                app_values.append(int(value))
+        # Only the window is needed for the maths. Reading the whole rating history
+        # of a long-lived user on every new rating does not scale past a few months.
+        chat_window = await _recent_values(session, to_user_id, RatingType.chat, window)
+        app_window = await _recent_values(session, to_user_id, RatingType.appearance, window)
+        chat_total = await _count(session, to_user_id, RatingType.chat)
+        app_total = await _count(session, to_user_id, RatingType.appearance)
 
-        chat_window = chat_values[-window:]
-        app_window = app_values[-window:]
-
-        user.chat_ratings_count = len(chat_values)
-        user.appearance_ratings_count = len(app_values)
-        user.calibration_counter = len(chat_values)
+        user.chat_ratings_count = chat_total
+        user.appearance_ratings_count = app_total
+        user.calibration_counter = chat_total
 
         user.season_rating_chat = self.blended(chat_window)
         user.season_rating_appearance = self.blended(app_window)
-        user.last_20_avg_chat = _mean(chat_values[-20:])
-        user.last_20_avg_appearance = _mean(app_values[-20:])
+        user.last_20_avg_chat = _mean(chat_window[-20:])
+        user.last_20_avg_appearance = _mean(app_window[-20:])
 
-        if len(chat_values) >= int(self._settings.rating_min_count) and previous_chat:
+        if chat_total >= int(self._settings.rating_min_count) and previous_chat:
             if previous_chat - user.season_rating_chat >= 3:
                 user.is_under_review = True
 
@@ -165,6 +155,34 @@ class RatingService:
             appearance_count=int(user.appearance_ratings_count),
             seasonal_valid=True,
         )
+
+
+async def _recent_values(
+    session: AsyncSession, to_user_id: int, rating_type: RatingType, limit: int
+) -> list[int]:
+    """Newest `limit` valid ratings, returned oldest-first for the rolling maths."""
+    res = await session.execute(
+        select(Rating.value)
+        .where(
+            Rating.to_user_id == to_user_id,
+            Rating.rating_type == rating_type,
+            Rating.is_seasonal_valid.is_(True),
+        )
+        .order_by(Rating.created_at.desc(), Rating.id.desc())
+        .limit(max(1, int(limit)))
+    )
+    return [int(v) for v in res.scalars().all()][::-1]
+
+
+async def _count(session: AsyncSession, to_user_id: int, rating_type: RatingType) -> int:
+    res = await session.execute(
+        select(func.count(Rating.id)).where(
+            Rating.to_user_id == to_user_id,
+            Rating.rating_type == rating_type,
+            Rating.is_seasonal_valid.is_(True),
+        )
+    )
+    return int(res.scalar_one() or 0)
 
 
 def _mean(values: list[int]) -> float:

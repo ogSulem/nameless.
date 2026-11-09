@@ -64,7 +64,6 @@ async def _clear_pending(redis: Redis, tg_id: int) -> None:
             keys.pending_rating_step(tg_id),
             keys.pending_rating_has_photos(tg_id),
             keys.pending_rating_action(tg_id),
-            keys.ui_rating_message_id(tg_id),
         ):
             pipe.delete(key)
         await pipe.execute()

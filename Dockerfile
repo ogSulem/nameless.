@@ -32,8 +32,8 @@ COPY --chown=appuser:appuser alembic.ini entrypoint.sh ./
 COPY --chown=appuser:appuser app/database/migrations ./app/database/migrations
 
 RUN chmod +x /app/entrypoint.sh \
-    && mkdir -p /app/logs /app/media \
-    && chown -R appuser:appuser /app/logs /app/media
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app/logs
 
 USER appuser
 

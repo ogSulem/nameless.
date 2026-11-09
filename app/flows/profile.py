@@ -12,8 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.database.models import User
 from app.keyboards.profile import profile_kb
-from app.redis import keys
-from app.services.matchmaking import MatchmakingService
+from app.services.matchmaking import MatchmakingService, normalize_seek
 from app.ui import edit_ui, send_new_ui
 
 logger = logging.getLogger(__name__)
@@ -42,6 +41,14 @@ def rating_line(user: User) -> str:
     return line
 
 
+SEEK_LABELS = {"male": "👦 парней", "female": "👧 девушек", "any": "🤷 не важно"}
+
+
+def seek_label(user: User) -> str:
+    value = normalize_seek(user.seek_gender, getattr(user.gender, "value", user.gender))
+    return SEEK_LABELS[value]
+
+
 def profile_text(user: User, settings: Settings, premium_mode: str = "chat") -> str:
     gender_value = getattr(user.gender, "value", user.gender)
     gender = "👦 парень" if gender_value == "male" else "👧 девушка"
@@ -54,6 +61,7 @@ def profile_text(user: User, settings: Settings, premium_mode: str = "chat") -> 
         f"Пол: {gender}",
         f"Возраст: {age_of(user.birth_date)}",
         f"Город: {city}",
+        f"Ищу: {seek_label(user)}",
         rating_line(user),
     ]
     if is_premium and user.subscription_until is not None:
@@ -102,9 +110,3 @@ async def show_profile(
     else:
         await edit_ui(bot, redis, tg_id, text, kb=kb)
 
-
-async def invalidate_profile(redis: Redis, tg_id: int) -> None:
-    try:
-        await redis.delete(keys.profile_text(int(tg_id)))
-    except Exception:
-        pass

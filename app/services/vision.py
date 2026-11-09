@@ -10,6 +10,16 @@ from app.config import Settings
 logger = logging.getLogger(__name__)
 
 
+def _shared_semaphore(limit: int) -> asyncio.Semaphore:
+    global _SEM
+    if _SEM is None:
+        _SEM = asyncio.Semaphore(limit)
+    return _SEM
+
+
+_SEM: asyncio.Semaphore | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class FaceVerdict:
     has_face: bool
@@ -32,12 +42,26 @@ class FaceDetector:
     wheel broke would be far worse than a missed check.
     """
 
+    _shared: FaceDetector | None = None
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._cv2 = None
         self._cascade = None
         self._loaded = False
-        self._sem = asyncio.Semaphore(max(1, int(settings.vision_concurrency)))
+        self._sem = _shared_semaphore(max(1, int(settings.vision_concurrency)))
+
+    @classmethod
+    def shared(cls, settings: Settings) -> FaceDetector:
+        """One detector per process.
+
+        Building a new instance per photo re-read the Haar cascade from disk and
+        reset the concurrency semaphore on every message, so the limit never
+        actually limited anything.
+        """
+        if cls._shared is None:
+            cls._shared = cls(settings)
+        return cls._shared
 
     # ------------------------------------------------------------------ loading
     def _load(self):

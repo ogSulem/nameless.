@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html import escape
 
+from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -328,11 +329,27 @@ async def reset_rating(session: AsyncSession, user: User, *, admin_tg: int) -> A
     return ActionResult(True, f"Рейтинг сброшен: {user.telegram_id}")
 
 
-async def delete_user_data(session: AsyncSession, user: User, *, admin_tg: int) -> ActionResult:
-    """Hard delete on a user's request (152-ФЗ ст. 21). Payments stay for accounting."""
+async def delete_user_data(
+    session: AsyncSession,
+    user: User,
+    *,
+    admin_tg: int,
+    redis: Redis | None = None,
+    settings: Settings | None = None,
+) -> ActionResult:
+    """Hard delete on a user's request (152-ФЗ ст. 21). Payments stay for accounting.
+
+    Goes through the same purge as the user-facing /delete_me, so the partner is
+    not left in a dialog with a ghost and no cache outlives the profile.
+    """
+    from app.services.account import purge_user
+
     tg = int(user.telegram_id)
-    await session.delete(user)
-    await session.commit()
+    if redis is not None and settings is not None:
+        await purge_user(session, redis, settings, tg)
+    else:  # pragma: no cover - only for callers that hold no Redis handle
+        await session.delete(user)
+        await session.commit()
     await log_action(session, admin_tg=admin_tg, action="gdpr_delete", target_tg=tg)
     return ActionResult(True, f"Данные удалены: {tg}")
 

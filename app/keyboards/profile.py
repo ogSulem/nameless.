@@ -16,9 +16,12 @@ def profile_kb(
         rows.append([InlineKeyboardButton(text="💎 Premium — подписка", callback_data="pay:premium")])
     if premium:
         mode_label = "по внешности" if premium_mode == "appearance" else "по общению"
-        rows.append(
-            [InlineKeyboardButton(text=f"💎 Подбор {mode_label} — сменить", callback_data="premium:mode")]
-        )
+        premium_row = [
+            InlineKeyboardButton(text=f"💎 Подбор {mode_label} — сменить", callback_data="premium:mode")
+        ]
+        if payments_enabled:
+            premium_row.append(InlineKeyboardButton(text="💎 Продлить", callback_data="pay:premium"))
+        rows.append(premium_row)
     rows.append(
         [
             InlineKeyboardButton(text="🏙 Город", callback_data="profile:city"),

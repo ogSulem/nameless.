@@ -38,16 +38,6 @@ end
 return {}
 """
 
-# Transactional claim of a reserved candidate: only succeeds for the reserving user.
-# ARGV[1]=me ARGV[2]=candidate ARGV[3]=ttl_ms
-CLAIM_LUA = r"""
-if redis.call("GET", "lock:match:" .. ARGV[2]) == ARGV[1] then
-  redis.call("SET", "lock:match:" .. ARGV[2], ARGV[1], "PX", ARGV[3])
-  return 1
-end
-return 0
-"""
-
 # Release my reservation, but only if I still own it.
 RELEASE_LUA = r"""
 if redis.call("GET", KEYS[1]) == ARGV[1] then

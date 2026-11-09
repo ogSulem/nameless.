@@ -18,22 +18,25 @@ def seek_gender_key(tg_id: int) -> str:
     return f"v2:seek_gender:{tg_id}"
 
 
+def seek_display_key(tg_id: int) -> str:
+    """The raw choice (male/female/any) for the admin card — the matching cache
+    above is normalised, this one is what the person actually tapped."""
+    return f"seek:display:{tg_id}"
+
+
 # --------------------------------------------------------------------- online
 def online_key(tg_id: int) -> str:
     return f"online:{tg_id}"
 
 
+def seen_key(tg_id: int) -> str:
+    """Throttles the `last_seen_at` UPDATE to once per few minutes."""
+    return f"seen:{tg_id}"
+
+
 # --------------------------------------------------------------------- locks
 def lock_match(tg_id: int) -> str:
     return f"lock:match:{tg_id}"
-
-
-def lock_finish_dialog(tg_id: int) -> str:
-    return f"lock:finish_dialog:{tg_id}"
-
-
-def lock_rating(tg_id: int) -> str:
-    return f"lock:rating:{tg_id}"
 
 
 # -------------------------------------------------------------------- dialog
@@ -91,18 +94,6 @@ def appearance_rating_required(tg_id: int, dialog_id: int) -> str:
 
 
 # ------------------------------------------------------------------------ ui
-def user_id_by_tg(tg_id: int) -> str:
-    return f"user:id_by_tg:{tg_id}"
-
-
-def user_rating_chat_by_tg(tg_id: int) -> str:
-    return f"user:rating_chat_by_tg:{tg_id}"
-
-
-def profile_text(tg_id: int) -> str:
-    return f"profile:text:{tg_id}"
-
-
 def ui_message_id(tg_id: int) -> str:
     return f"ui:message_id:{tg_id}"
 
@@ -111,17 +102,9 @@ def ui_search_message_id(tg_id: int) -> str:
     return f"ui:search_message_id:{tg_id}"
 
 
-def ui_rating_message_id(tg_id: int) -> str:
-    return f"ui:rating_message_id:{tg_id}"
-
-
 # ------------------------------------------------------------------ payments
 def payment_pending(tg_id: int) -> str:
     return f"payment:pending:{tg_id}"
-
-
-def payment_processed(provider: str, external_id: str) -> str:
-    return f"payment:processed:{provider}:{external_id}"
 
 
 # --------------------------------------------------------------------- misc

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.access import ROLE_TITLES, Role, role_for
 from app.config import Settings
 from app.database.models import ComplaintStatus
+from app.flows.profile import seek_label
 from app.flows.states import AdminPanel
 from app.keyboards.admin import (
     admin_menu_kb,
@@ -181,22 +182,9 @@ async def _show_user_card(
         )
         return
 
-    seek = await _seek_label(redis, int(user.telegram_id))
-    card = await service.user_card(session, user, settings, intent=seek)
+    card = await service.user_card(session, user, settings, intent=seek_label(user))
     kb = user_card_kb(tg_id=int(user.telegram_id), banned=bool(user.is_banned), is_admin_role="")
     await _render(bot, redis, admin_tg, card.text, kb, call=call)
-
-
-async def _seek_label(redis: Redis, tg_id: int) -> str:
-    """"Whom is this user looking for" lives in Redis, written at registration."""
-    try:
-        raw = await redis.get(f"seek:display:{tg_id}")
-    except Exception:
-        return ""
-    if raw is None:
-        return ""
-    value = raw.decode() if isinstance(raw, bytes) else str(raw)
-    return {"male": "парней", "female": "девушек", "any": "всех"}.get(value, value)
 
 
 @router.callback_query(F.data.startswith("adm:user:"))
@@ -243,6 +231,7 @@ async def adm_ban(call: CallbackQuery, session: AsyncSession, redis: Redis, sett
     result = await service.set_ban(
         session, user, admin_tg=int(call.from_user.id), banned=True, reason="нарушение правил"
     )
+    await _stop_activity(call.bot, session, redis, settings, int(user.telegram_id))
     await _notify_user(
         call.bot, int(user.telegram_id),
         "🚫 Аккаунт заблокирован модерацией.\n"
@@ -252,6 +241,22 @@ async def adm_ban(call: CallbackQuery, session: AsyncSession, redis: Redis, sett
     await _show_user_card(
         call.bot, redis, session, settings, int(call.from_user.id), int(user.telegram_id), call=call
     )
+
+
+async def _stop_activity(
+    bot: Bot, session: AsyncSession, redis: Redis, settings: Settings, tg_id: int
+) -> None:
+    """A ban must not leave a partner waiting for messages that will never come."""
+    from app.handlers.dialog import finish_dialog
+    from app.services.dialog import DialogService
+
+    svc = DialogService(redis, settings)
+    dialog_id = await svc.active_dialog_id(session, tg_id)
+    if dialog_id:
+        await finish_dialog(bot, session, redis, settings, dialog_id, tg_id, action="end")
+    from app.services.matchmaking import MatchmakingService
+
+    await MatchmakingService(redis, settings).dequeue(tg_id)
 
 
 @router.callback_query(F.data.startswith("adm:unban:"))

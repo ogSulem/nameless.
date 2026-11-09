@@ -35,7 +35,3 @@ def role_for(settings: Settings, tg_id: int | None) -> Role | None:
 def has_role(settings: Settings, tg_id: int | None, minimum: Role) -> bool:
     role = role_for(settings, tg_id)
     return role is not None and role >= minimum
-
-
-def is_any_admin(settings: Settings, tg_id: int | None) -> bool:
-    return role_for(settings, tg_id) is not None

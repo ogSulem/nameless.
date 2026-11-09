@@ -54,7 +54,6 @@ services:
         condition: service_healthy
     volumes:
       - ./logs:/app/logs
-      - ./media:/app/media
     logging:
       driver: "json-file"
       options:

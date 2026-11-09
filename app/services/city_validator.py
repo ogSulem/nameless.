@@ -60,7 +60,3 @@ def sanitize_city(raw: str) -> str | None:
     if key in CANONICAL_CITIES:
         return CANONICAL_CITIES[key]
     return normalize_city_name(value)
-
-
-def is_known_city(city: str) -> bool:
-    return _canonical(city) in CANONICAL_CITIES

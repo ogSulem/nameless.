@@ -10,12 +10,3 @@ def payment_kb(invoice_url: str | None, *, pay_text: str = "💳 Оплатит�
     rows.append([InlineKeyboardButton(text="🔄 Я оплатил — проверить", callback_data="pay:check")])
     rows.append([InlineKeyboardButton(text="← Назад", callback_data="menu:profile")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def invoice_kb(pay_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить", url=pay_url)],
-            [InlineKeyboardButton(text="← Назад", callback_data="menu:profile")],
-        ]
-    )

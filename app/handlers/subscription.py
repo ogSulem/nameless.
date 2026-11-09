@@ -7,7 +7,7 @@ from html import escape
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, PreCheckoutQuery
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, PreCheckoutQuery
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,23 +44,44 @@ async def open_premium(
     settings: Settings,
     tg_id: int,
     state: FSMContext | None = None,
+    *,
+    buying: bool = False,
 ) -> None:
+    """Premium screen. `buying=True` means the user pressed "buy/extend"."""
     user = await get_user(session, tg_id)
     if user is None:
         await edit_ui(bot, redis, tg_id, "Профиль не найден. Нажмите /start.")
         return
 
-    if premium_active(user):
+    if premium_active(user) and not buying:
         await edit_ui(
             bot, redis, tg_id,
-            "💎 <b>Premium уже активен</b>\n\n"
+            "💎 <b>Premium активен</b>\n\n"
             f"Статус: {_premium_status_text(settings, user.subscription_until)}\n\n"
             "Что даёт Premium:\n"
             "• приоритет в подборе собеседников с высоким рейтингом;\n"
             "• в первую очередь показываются те, у кого рейтинг общения "
             f"{settings.premium_min_rating:.0f}+.\n\n"
-            "Продлить подписку можно после окончания текущей.",
-            kb=back_kb("menu:profile"),
+            + (
+                f"Продление добавит {settings.subscription_days} дней к текущему сроку."
+                if settings.payments_enabled
+                else "Оплата временно недоступна — загляните позже."
+            ),
+            kb=(
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=f"💎 Продлить на {settings.subscription_days} дней",
+                                callback_data="pay:premium",
+                            )
+                        ],
+                        [InlineKeyboardButton(text="← Назад", callback_data="menu:profile")],
+                    ]
+                )
+                if settings.payments_enabled
+                else back_kb("menu:profile")
+            ),
         )
         return
 
@@ -113,7 +134,8 @@ def _offer_text(settings: Settings, until: datetime | None) -> str:
     return (
         "💎 <b>Premium</b>\n\n"
         f"Цена: <b>{settings.subscription_price_rub} ₽</b> за {settings.subscription_days} дней.\n"
-        "Оплата разовая — автопродления нет.\n\n"
+        "Оплата разовая — автопродления нет. Если подписка ещё действует, "
+        "дни добавляются к текущему сроку.\n\n"
         "Что даёт:\n"
         f"• в первую очередь собеседники с рейтингом {settings.premium_min_rating:.0f}+;\n"
         "• приоритет в подборе;\n"
@@ -166,7 +188,7 @@ async def pay_premium(
         await safe_answer_callback(call)
         return
 
-    await open_premium(call.bot, redis, session, settings, tg_id)
+    await open_premium(call.bot, redis, session, settings, tg_id, buying=True)
     await safe_answer_callback(call)
 
 

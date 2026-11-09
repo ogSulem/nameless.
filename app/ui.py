@@ -74,13 +74,6 @@ async def send_new_ui(
     return msg
 
 
-async def cleanup_screen(bot: Bot, redis: Redis, tg_id: int, *, keyboard_too: bool = False) -> None:
-    prev = await get_ui_message_id(redis, tg_id)
-    if prev and keyboard_too:
-        await safe_delete_message(bot, tg_id, prev)
-    await clear_ui_message_id(redis, tg_id)
-
-
 async def _get_int(redis: Redis, key: str) -> int | None:
     try:
         raw = await redis.get(key)

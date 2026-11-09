@@ -48,7 +48,19 @@ class _Candidate:
 
 
 def seek_gender_for(gender: str) -> str:
+    """Default preference: the opposite gender."""
     return "female" if gender == "male" else "male"
+
+
+def normalize_seek(value: str | None, my_gender: str) -> str:
+    """`any` is a real option, not a synonym for "the opposite gender"."""
+    if value in {"male", "female", "any"}:
+        return str(value)
+    return seek_gender_for(my_gender)
+
+
+def seek_targets(seek: str) -> tuple[str, ...]:
+    return ("male", "female") if seek == "any" else (seek,)
 
 
 class MatchmakingService:
@@ -126,8 +138,8 @@ class MatchmakingService:
             pipe.set(keys.queue_member_key(tg), _member_payload(user), ex=int(self._settings.online_ttl_s))
             pipe.set(
                 keys.seek_gender_key(tg),
-                seek_gender_for(user.gender.value),
-                ex=60 * 60 * 24,
+                normalize_seek(user.seek_gender, user.gender.value),
+                ex=60 * 60 * 24 * 365,
             )
             await pipe.execute()
         except Exception:
@@ -152,6 +164,16 @@ class MatchmakingService:
             await self._redis.delete(member_key)
         except Exception:
             logger.warning("dequeue_failed tg=%s", tg, exc_info=True)
+
+    async def seek_preference(self, session: AsyncSession, user: User) -> str:
+        return await self._seek_gender(int(user.telegram_id), user.gender.value, user.seek_gender)
+
+    async def waiting_count(self, seek: str) -> int:
+        """How many people are waiting for *any* gender this user accepts."""
+        total = 0
+        for target in seek_targets(seek):
+            total += await self.queue_size(target, None)
+        return total
 
     async def queue_size(self, gender: str, city: str | None = None) -> int:
         """How many people are waiting for this gender right now."""
@@ -187,11 +209,14 @@ class MatchmakingService:
         await self.dequeue(tg)
         await self.mark_online(tg)
 
-        seek = await self._seek_gender(tg, user.gender.value)
+        seek = await self._seek_gender(tg, user.gender.value, user.seek_gender)
         queues: list[str] = []
-        if user.city:
-            queues.append(keys.queue_key(seek, user.city))
-        queues.append(keys.queue_key(seek, None))
+        # Same city first, then the whole country, for every gender we accept —
+        # so "any" is honest and a small city still gets a full pool.
+        for target in seek_targets(seek):
+            if user.city:
+                queues.append(keys.queue_key(target, user.city))
+            queues.append(keys.queue_key(target, None))
 
         mode = await self.premium_mode(tg) if premium else "chat"
         candidate = await self._pick_candidate(session, user, queues, premium, mode)
@@ -228,14 +253,13 @@ class MatchmakingService:
             logger.warning("active_dialog_check_failed tg=%s", tg, exc_info=True)
             return False
 
-    async def _seek_gender(self, tg: int, my_gender: str) -> str:
+    async def _seek_gender(self, tg: int, my_gender: str, db_value: str | None = None) -> str:
+        """Redis first (hot path), then the DB column written at registration."""
         try:
             pref = _as_str(await self._redis.get(keys.seek_gender_key(tg)))
         except Exception:
             pref = None
-        if pref in {"male", "female"}:
-            return pref
-        return seek_gender_for(my_gender)
+        return normalize_seek(pref or db_value, my_gender)
 
     async def _pick_candidate(
         self,
@@ -286,12 +310,12 @@ class MatchmakingService:
                 for raw in fresh:
                     online, seek, redis_busy = hints.get(raw.telegram_id, (True, None, False))
                     if not online:
-                        await self._release(raw)  # ghost entry: drop it
+                        await self._release(raw, owner=me, requeue=False)  # ghost: drop it
                         continue
 
                     row = rows.get(raw.telegram_id)
                     if row is None or row.db_id == user.id or row.is_banned or row.is_deleted:
-                        await self._release(raw)
+                        await self._release(raw, owner=me, requeue=False)
                         continue
 
                     cand = _Candidate(
@@ -307,13 +331,13 @@ class MatchmakingService:
 
                     # Mutual consent: they must be looking for my gender as well,
                     # otherwise a woman seeking women could be matched with a man.
-                    candidate_seek = seek or seek_gender_for(row.gender)
-                    if candidate_seek != my_gender:
+                    candidate_seek = normalize_seek(seek or row.seek_gender, row.gender)
+                    if candidate_seek != "any" and candidate_seek != my_gender:
                         skipped.append(cand)
                         continue
 
                     if redis_busy or row.db_id in busy:
-                        await self._release(cand)
+                        await self._release(cand, owner=me)
                         continue
 
                     if not premium:
@@ -327,7 +351,7 @@ class MatchmakingService:
                     if len(reserved) < int(PREMIUM_PROBE):
                         reserved.append(cand)
                     else:
-                        await self._release(cand, requeue=True)
+                        await self._release(cand, owner=me, requeue=True)
 
                 if not premium or len(reserved) >= int(PREMIUM_PROBE):
                     break
@@ -343,9 +367,9 @@ class MatchmakingService:
             for cand in reserved:
                 if chosen is not None and cand.telegram_id == chosen.telegram_id:
                     continue
-                await self._release(cand, requeue=True)
+                await self._release(cand, owner=me, requeue=True)
             for cand in skipped:
-                await self._release(cand, requeue=True)
+                await self._release(cand, owner=me, requeue=True)
 
     async def _reserve_batch(self, queues: list[str], me: int, size: int) -> list[_Candidate]:
         out: list[_Candidate] = []
@@ -399,6 +423,7 @@ class MatchmakingService:
                     User.season_rating_appearance,
                     User.appearance_ratings_count,
                     User.gender,
+                    User.seek_gender,
                 ).where(User.telegram_id.in_([int(i) for i in ids]))
             )
             rows = res.all()
@@ -417,6 +442,7 @@ class MatchmakingService:
                 appearance=float(row[6] or 0.0),
                 appearance_count=int(row[7] or 0),
                 gender=str(getattr(row[8], "value", row[8]) or "male"),
+                seek_gender=(str(row[9]) if row[9] in {"male", "female", "any"} else None),
             )
         return out
 
@@ -466,9 +492,15 @@ class MatchmakingService:
             score=_as_str(raw[2]) or str(int(now)),
         )
 
-    async def _release(self, cand: _Candidate, requeue: bool = False) -> None:
+    async def _release(self, cand: _Candidate, owner: int, requeue: bool = False) -> None:
+        """Drop my reservation on `cand` (only if I still own it) and optionally re-queue them.
+
+        `owner` is the reserving user's telegram id — it is what RESERVE_LUA stores
+        in the lock. Passing the candidate's own id here silently left every
+        skipped candidate locked for the whole 5s reservation TTL.
+        """
         try:
-            await self._redis.eval(RELEASE_LUA, 1, keys.lock_match(cand.telegram_id), str(cand.telegram_id))
+            await self._redis.eval(RELEASE_LUA, 1, keys.lock_match(cand.telegram_id), str(int(owner)))
         except Exception:
             logger.warning("release_lock_failed tg=%s", cand.telegram_id, exc_info=True)
 
@@ -498,6 +530,7 @@ class MatchmakingService:
         appearance: float = 0.0
         appearance_count: int = 0
         gender: str = "male"
+        seek_gender: str | None = None
 
     async def _create_dialog(self, session: AsyncSession, user: User, cand: _Candidate) -> int | None:
         try:
@@ -514,12 +547,12 @@ class MatchmakingService:
             return int(dialog.id)
         except IntegrityError:
             await session.rollback()
-            await self._release(cand, requeue=True)
+            await self._release(cand, owner=int(user.telegram_id), requeue=True)
             logger.info("match_race_lost cand=%s", cand.telegram_id)
             return None
         except DBAPIError:
             await session.rollback()
-            await self._release(cand, requeue=True)
+            await self._release(cand, owner=int(user.telegram_id), requeue=True)
             logger.exception("match_create_failed my_tg=%s cand=%s", user.telegram_id, cand.telegram_id)
             return None
 

@@ -13,7 +13,7 @@ from app.handlers.commands import get_user
 from app.keyboards.search import searching_kb
 from app.redis import keys
 from app.services.dialog import DialogService
-from app.services.matchmaking import MatchmakingService, seek_gender_for
+from app.services.matchmaking import MatchmakingService
 from app.services.notifications import announce_match
 from app.telegram_safe import safe_answer_callback
 from app.ui import edit_ui, get_ui_message_id
@@ -65,9 +65,8 @@ async def start_search_for(
     result = await matchmaking.try_match(session=session, user=user, premium=premium)
 
     if result is None:
-        waiting = await matchmaking.queue_size(
-            seek_gender_for(getattr(user.gender, "value", user.gender)), None
-        )
+        seek = await matchmaking.seek_preference(session, user)
+        waiting = await matchmaking.waiting_count(seek)
         text = SEARCHING_TEXT if waiting > 1 else EMPTY_QUEUE_TEXT
         await edit_ui(bot, redis, tg_id, text, kb=searching_kb())
         mid = await get_ui_message_id(redis, tg_id)

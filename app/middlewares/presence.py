@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import Settings
 from app.database.models import User
+from app.redis import keys
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,16 @@ class PresenceMiddleware(BaseMiddleware):
         if user is not None and not getattr(user, "is_bot", False):
             tg_id = int(user.id)
             try:
-                await self._redis.set(f"online:{tg_id}", "1", ex=int(self._settings.online_ttl_s))
+                await self._redis.set(
+                    keys.online_key(tg_id), "1", ex=int(self._settings.online_ttl_s)
+                )
             except Exception:
                 pass
 
             try:
-                fresh = await self._redis.set(f"seen:{tg_id}", "1", nx=True, ex=TOUCH_EVERY_S)
+                fresh = await self._redis.set(
+                    keys.seen_key(tg_id), "1", nx=True, ex=TOUCH_EVERY_S
+                )
             except Exception:
                 fresh = False
 

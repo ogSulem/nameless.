@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,8 +53,13 @@ async def finish_dialog(
     actor_tg: int,
     *,
     action: str = "end",
+    note: str | None = None,
 ) -> list[int]:
-    """Close a dialog and open the anonymous rating flow for both participants."""
+    """Close a dialog and open the anonymous rating flow for both participants.
+
+    `note` is prepended to the rating screen (e.g. "собеседник недоступен") so a
+    real explanation never replaces the chance to rate.
+    """
     svc = DialogService(redis, settings)
     telegram_ids = await svc.finish(session, dialog_id, actor_tg_id=actor_tg) or []
     if not telegram_ids:
@@ -110,17 +115,12 @@ async def finish_dialog(
             bot,
             redis,
             tg,
-            "⭐ <b>Насколько комфортным было общение?</b>\n\n"
+            (note + "\n\n" if note else "")
+            + "⭐ <b>Насколько комфортным было общение?</b>\n\n"
             "Оценка анонимна: собеседник не увидит, кто её поставил.\n"
             "Можно пропустить — тогда просто вернётесь в профиль.",
             kb=rating_kb("rate:chat"),
         )
-        mid = await get_ui_message_id(redis, tg)
-        if mid:
-            try:
-                await redis.set(keys.ui_rating_message_id(tg), str(mid), ex=RATING_TTL_S)
-            except Exception:
-                pass
 
     logger.info("dialog_finished dialog_id=%s actor=%s action=%s", dialog_id, actor_tg, action)
     return telegram_ids
@@ -165,23 +165,11 @@ async def finish_by_button(message: Message, session: AsyncSession, redis: Redis
     await finish_dialog(message.bot, session, redis, settings, dialog_id, tg_id, action=action)
 
 
-@router.callback_query(F.data == "dialog:next")
-async def next_callback(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
-    tg_id = int(call.from_user.id)
-    dialog_id = await DialogService(redis, settings).active_dialog_id(session, tg_id)
-    if not dialog_id:
-        await _answer(call, "Диалог уже завершён")
-        return
-    await finish_dialog(call.bot, session, redis, settings, dialog_id, tg_id, action="next")
-    await _answer(call)
-
 
 # ----------------------------------------------------------------------- relay
 @router.message()
 async def relay_message(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
     if message.from_user is None or message.chat is None:
-        raise SkipHandler
-    if not _ratable(message):
         raise SkipHandler
 
     tg_id = int(message.from_user.id)
@@ -189,6 +177,18 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
     dialog_id = await svc.active_dialog_id(session, tg_id)
     if not dialog_id:
         raise SkipHandler
+
+    if not _ratable(message):
+        # A contact, location or poll: copy_message cannot relay it, and dropping
+        # it silently made people think the bot was broken.
+        await _delete(message)
+        await _notice(
+            message.bot,
+            redis,
+            tg_id,
+            "Такое переслать нельзя. Можно текстом, фото, видео, голосовым или стикером.",
+        )
+        return
 
     me = await _user(session, tg_id)
     info = await svc.dialog_info(session, dialog_id, tg_id)
@@ -208,7 +208,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
             return
 
     allowed, _ = await hit(
-        redis, key=f"rl:msg:{tg_id}", limit=int(settings.messages_per_10s), window_s=10
+        redis, key=keys.rate(f"msg:{tg_id}"), limit=int(settings.messages_per_10s), window_s=10
     )
     if not allowed:
         await _delete(message)
@@ -217,7 +217,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
 
     if message.photo:
         photo_allowed, _ = await hit(
-            redis, key=f"rl:photo:{tg_id}", limit=int(settings.photos_per_minute), window_s=60
+            redis, key=keys.rate(f"photo:{tg_id}"), limit=int(settings.photos_per_minute), window_s=60
         )
         if not photo_allowed:
             await _delete(message)
@@ -233,11 +233,15 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         )
     except UserBlockedBot:
         await _delete(message)
-        await finish_dialog(message.bot, session, redis, settings, dialog_id, tg_id, action="end")
-        await edit_ui(
-            message.bot, redis, tg_id,
-            "Собеседник больше не может получать сообщения — диалог завершён.\n\n"
-            "Нажмите «🔎 Найти собеседника», чтобы найти нового.",
+        await finish_dialog(
+            message.bot,
+            session,
+            redis,
+            settings,
+            dialog_id,
+            tg_id,
+            action="end",
+            note="Собеседник больше не может получать сообщения — диалог завершён.",
         )
         return
     except Exception:
@@ -275,7 +279,7 @@ async def _photo_pipeline(
             await redis.set(keys.appearance_rating_required(info.partner_telegram_id, info.dialog_id), "1", ex=3600)
             return
 
-        detector = FaceDetector(settings)
+        detector = FaceDetector.shared(settings)
         if not detector.available:
             return
 
@@ -337,10 +341,3 @@ async def _delete_later(bot: Bot, tg_id: int, message_id: int, delay: float) -> 
         await safe_delete_message(bot, tg_id, message_id)
     except Exception:
         logger.debug("notice_cleanup_failed tg=%s", tg_id)
-
-
-async def _answer(call: CallbackQuery, text: str | None = None) -> None:
-    try:
-        await call.answer(text)
-    except Exception:
-        pass

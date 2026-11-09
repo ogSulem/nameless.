@@ -104,7 +104,39 @@ async def refresh_lock(redis: Redis, value: str) -> None:
 
 
 # -------------------------------------------------------------------- jobs
-async def sweeper_loop(settings: Settings, redis: Redis, session_factory) -> None:
+async def _notify_expired_dialogs(
+    bot: Bot,
+    redis: Redis,
+    session_factory,
+    settings: Settings,
+    closed: list[tuple[int, list[int]]],
+) -> None:
+    """A dialog closed by the sweeper must not vanish without a word.
+
+    Reuses the normal finish flow, so both sides get the rating screen (and the
+    reply keyboard is removed) instead of typing into the void.
+    """
+    from app.handlers.dialog import finish_dialog
+
+    hours = int(settings.dialog_max_hours)
+    for dialog_id, _telegram_ids in closed:
+        try:
+            async with session_factory() as session:
+                await finish_dialog(
+                    bot,
+                    session,
+                    redis,
+                    settings,
+                    int(dialog_id),
+                    actor_tg=0,
+                    action="timeout",
+                    note=f"⏳ Диалог закрыт автоматически: лимит {hours} ч.",
+                )
+        except Exception:
+            logger.info("expired_dialog_notify_failed dialog_id=%s", dialog_id, exc_info=True)
+
+
+async def sweeper_loop(settings: Settings, redis: Redis, session_factory, bot: Bot) -> None:
     """Close abandoned dialogs and enforce retention — the privacy policy promise."""
     last_retention = 0.0
     while True:
@@ -116,9 +148,11 @@ async def sweeper_loop(settings: Settings, redis: Redis, session_factory) -> Non
                 for _dialog_id, telegram_ids in closed:
                     for tg in telegram_ids:
                         try:
-                            await redis.delete(keys.active_dialog(tg), keys.online_key(tg))
+                            await redis.delete(keys.active_dialog(tg))
                         except Exception:
                             pass
+            if closed:
+                await _notify_expired_dialogs(bot, redis, session_factory, settings, closed)
 
             now = asyncio.get_running_loop().time()
             if now - last_retention >= RETENTION_INTERVAL_S:
@@ -225,7 +259,7 @@ async def run() -> int:
     tasks = [
         asyncio.create_task(refresh_lock(redis, lock_value)),
         asyncio.create_task(metrics_loop()),
-        asyncio.create_task(sweeper_loop(settings, redis, session_factory)),
+        asyncio.create_task(sweeper_loop(settings, redis, session_factory, bot)),
     ]
 
     # If the bot was ever used with a webhook (another host, hand-made setup),

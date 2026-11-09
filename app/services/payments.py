@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from aiogram import Bot
 from aiogram.types import LabeledPrice
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,6 +82,10 @@ class PaymentService:
         external_id = uuid.uuid4().hex
         payload = f"{PAYLOAD_PREFIX}:{external_id}"
 
+        # A "Premium" screen can be opened many times; every open used to leave
+        # another forever-pending row. Expire the previous ones first.
+        await self._expire_pending(session, int(user.telegram_id))
+
         payment = Payment(
             provider="telegram",
             external_id=external_id,
@@ -132,6 +136,21 @@ class PaymentService:
         await self._remember_pending(int(user.telegram_id), external_id)
         return PaymentInit(url=str(url), payment_id=external_id, provider="telegram")
 
+    async def _expire_pending(self, session: AsyncSession, telegram_id: int) -> None:
+        try:
+            await session.execute(
+                update(Payment)
+                .where(
+                    Payment.telegram_id == int(telegram_id),
+                    Payment.status == "pending",
+                )
+                .values(status="expired")
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.warning("payment_expire_failed tg=%s", telegram_id, exc_info=True)
+
     async def complete_telegram_payment(self, session: AsyncSession, sp) -> tuple[bool, datetime | None]:
         """Verify + apply a successful_payment update exactly once."""
         payload = (sp.invoice_payload or "").strip()
@@ -153,8 +172,10 @@ class PaymentService:
             logger.info("payment_already_paid external_id=%s", external_id)
             return False, payment.paid_at
 
-        expected = self._settings.premium_price_kopecks
-        if sp.currency != "RUB" or int(sp.total_amount or 0) != expected or payment.amount != expected:
+        # `payment.amount` is what this invoice asked for: a price change between
+        # invoice and payment must not void money the user has already paid.
+        expected = int(payment.amount)
+        if sp.currency != "RUB" or int(sp.total_amount or 0) != expected:
             logger.error(
                 "payment_amount_mismatch external_id=%s got=%s/%s expected=%s",
                 external_id, sp.total_amount, sp.currency, expected,
@@ -194,6 +215,7 @@ class PaymentService:
             logger.error("yookassa_invoice_failed tg=%s err=%s", user.telegram_id, exc)
             raise PaymentError("yookassa_unavailable") from exc
 
+        await self._expire_pending(session, int(user.telegram_id))
         payment = Payment(
             provider="yookassa",
             external_id=payment_id,
@@ -278,7 +300,7 @@ class PaymentService:
                 paid_value = int(round(float(amount.get("value") or 0) * 100))
             except (TypeError, ValueError):
                 paid_value = -1
-            if paid_value != int(payment.amount) or payment.amount != self._settings.premium_price_kopecks:
+            if paid_value != int(payment.amount):
                 logger.error(
                     "yookassa_amount_mismatch id=%s paid=%s expected=%s",
                     payment.external_id, paid_value, payment.amount,

@@ -24,9 +24,3 @@ def complaint_prompt_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="← Отмена", callback_data="complaint:cancel")]]
     )
-
-
-def after_rating_kb(*, next_label: str = "🔎 Искать собеседника") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=next_label, callback_data="search:start")]]
-    )

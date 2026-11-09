@@ -98,10 +98,12 @@ class FakeSession(BaseSession):
             )
         if isinstance(method, EditMessageText):
             self.text_log.append(method.text or "")
+            # An edit replaces what the user actually sees, exactly like Telegram.
+            self.live[(method.chat_id, method.message_id)] = method.text or ""
             return Message.model_construct(
-                message_id=1,
+                message_id=method.message_id,
                 date=None,
-                chat=Chat.model_construct(id=1, type="private"),
+                chat=Chat.model_construct(id=method.chat_id, type="private"),
                 text=method.text,
             )
         if isinstance(method, CopyMessage):
