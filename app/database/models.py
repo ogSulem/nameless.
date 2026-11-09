@@ -84,16 +84,6 @@ class User(Base):
         Index("ix_users_premium_match", "season_rating_chat", "season_rating_appearance"),
     )
 
-    # ---------------------------------------------------------------- helpers
-    @property
-    def chat_rating_display(self) -> float:
-        return float(self.season_rating_chat or 0.0)
-
-    @property
-    def is_newbie(self) -> bool:
-        return int(self.chat_ratings_count or 0) == 0
-
-
 class DialogStatus(str, enum.Enum):
     active = "active"
     finished = "finished"

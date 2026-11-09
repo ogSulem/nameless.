@@ -22,7 +22,7 @@ def admin_menu_kb(*, role: str, open_complaints: int = 0) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def user_card_kb(*, tg_id: int, banned: bool, is_admin_role: str) -> InlineKeyboardMarkup:
+def user_card_kb(*, tg_id: int, banned: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(

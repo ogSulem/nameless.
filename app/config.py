@@ -80,7 +80,6 @@ class Settings(BaseSettings):
 
     # --- Vision -------------------------------------------------------------
     vision_enabled: bool = Field(default=True, alias="VISION_ENABLED")
-    vision_min_conf: float = Field(default=0.65, alias="VISION_MIN_CONF")
     vision_max_side: int = Field(default=640, alias="VISION_MAX_SIDE")
     vision_timeout_s: float = Field(default=4.0, alias="VISION_TIMEOUT_S")
     vision_concurrency: int = Field(default=2, alias="VISION_CONCURRENCY")
@@ -89,7 +88,6 @@ class Settings(BaseSettings):
     payments_provider_token: str = Field(default="", alias="PAYMENTS_PROVIDER_TOKEN")
     yookassa_shop_id: str = Field(default="", alias="YOOKASSA_SHOP_ID")
     yookassa_secret_key: str = Field(default="", alias="YOOKASSA_SECRET_KEY")
-    yookassa_webhook_secret: str = Field(default="", alias="YOOKASSA_WEBHOOK_SECRET")
     subscription_price_rub: int = Field(default=499, alias="SUBSCRIPTION_PRICE_RUB")
     subscription_days: int = Field(default=30, alias="SUBSCRIPTION_DAYS")
 

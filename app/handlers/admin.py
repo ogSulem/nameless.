@@ -183,7 +183,7 @@ async def _show_user_card(
         return
 
     card = await service.user_card(session, user, settings, intent=seek_label(user))
-    kb = user_card_kb(tg_id=int(user.telegram_id), banned=bool(user.is_banned), is_admin_role="")
+    kb = user_card_kb(tg_id=int(user.telegram_id), banned=bool(user.is_banned))
     await _render(bot, redis, admin_tg, card.text, kb, call=call)
 
 

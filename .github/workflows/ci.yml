@@ -44,7 +44,18 @@ jobs:
         env:
           BOT_TOKEN: 000000000:CI-TOKEN
           ADMINS: "1"
-        run: pytest -q
+        # The plain log is unreadable from outside GitHub's blob storage, so on
+        # failure the reason is repeated as an annotation on the check run.
+        run: |
+          set +e
+          pytest -q > pytest.log 2>&1
+          code=$?
+          cat pytest.log
+          if [ "$code" -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)|^E  |error(s)? during collection" pytest.log | head -25 |
+              while IFS= read -r line; do echo "::error title=pytest::$line"; done
+          fi
+          exit "$code"
 
   migrations:
     runs-on: ubuntu-latest

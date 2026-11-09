@@ -231,7 +231,8 @@ async def user_card(
 
     flags: list[str] = []
     if user.is_banned:
-        flags.append(f"🚫 <b>Бан</b> ({escape(user.ban_reason or 'без причины')})")
+        since = f" с {_aware(user.banned_at):%d.%m}" if _aware(user.banned_at) else ""
+        flags.append(f"🚫 <b>Бан</b>{since} ({escape(user.ban_reason or 'без причины')})")
     if user.is_deleted:
         flags.append("🗑 Удалён")
     if premium_until and premium_until > utcnow():
@@ -285,6 +286,7 @@ async def set_ban(
 ) -> ActionResult:
     user.is_banned = banned
     user.ban_reason = reason if banned else None
+    user.banned_at = utcnow() if banned else None
     await session.commit()
     await log_action(
         session,
