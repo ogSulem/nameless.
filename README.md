@@ -61,7 +61,7 @@ python -m app.main
 Проверки:
 
 ```bash
-pytest -q                   # 185 тестов, изоляция на SQLite + fakeredis
+pytest -q                   # 188 тестов, изоляция на SQLite + fakeredis
 ruff check app tests
 python -c "import app.main" # тот самый smoke-тест, который ловит битые wheels
 ```
@@ -269,7 +269,7 @@ SUPPORT=333333333           # только чтение
 
 ## Тесты
 
-185 тестов, ~14 секунд, без внешних сервисов:
+188 тестов, ~14 секунд, без внешних сервисов:
 
 | файл | что проверяет |
 |---|---|

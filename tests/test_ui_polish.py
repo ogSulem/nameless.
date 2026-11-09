@@ -199,3 +199,42 @@ async def test_help_inside_a_dialog_is_html_and_self_deleting(bot, dispatcher, s
     sent = [m for m in bot.session.sent if isinstance(m, SendMessage)]
     assert sent and sent[-1].parse_mode == "HTML"
     assert bot.session.live_count(9301) >= live_before, "the partner card must stay"
+
+
+@pytest.mark.asyncio
+async def test_start_during_a_dialog_keeps_the_conversation_on_screen(bot, dispatcher, session, make_user):
+    """`/start` in the middle of a chat must not delete the partner card."""
+    from app.database.models import Gender
+
+    for tg, gender in ((9501, Gender.male), (9502, Gender.female)):
+        await make_user(tg, gender=gender, city=None)
+        await send_text(bot, dispatcher, tg, "/start")
+    await press(bot, dispatcher, 9501, "search:start")
+    await press(bot, dispatcher, 9502, "search:start")
+    live_before = bot.session.live_count(9501)
+
+    await send_text(bot, dispatcher, 9501, "/start")
+
+    assert bot.session.live_count(9501) >= live_before, "the dialog screen must survive"
+    sent = [m for m in bot.session.sent if isinstance(m, SendMessage)]
+    assert sent and "идёт диалог" in (sent[-1].text or "")
+
+
+@pytest.mark.asyncio
+async def test_stale_rating_tap_lands_on_the_profile(bot, dispatcher, session, make_user):
+    """An old scale must not leave a dead-end notice where the profile was."""
+    from app.database.models import Gender
+
+    for tg, gender in ((9601, Gender.male), (9602, Gender.female)):
+        await make_user(tg, gender=gender, city=None)
+        await send_text(bot, dispatcher, tg, "/start")
+    await press(bot, dispatcher, 9601, "search:start")
+    await press(bot, dispatcher, 9602, "search:start")
+    await send_text(bot, dispatcher, 9601, "\U0001f6d1 Завершить")
+    await press(bot, dispatcher, 9601, "rate:chat:8")
+
+    await press(bot, dispatcher, 9601, "rate:chat:3")  # the survey is already over
+
+    live = bot.session.live_text(9601)
+    assert "👤 Профиль" in live, live
+    assert "неактуальна" not in live
