@@ -389,7 +389,8 @@ async def test_ban_closes_the_dialog_of_the_partner(bot, dispatcher, session, re
 @pytest.mark.asyncio
 async def test_complaint_card_survives_html_in_user_text(bot, dispatcher, session, make_user):
     """A message containing "<b>" must not break the moderator's card."""
-    from app.database.models import Complaint, Dialog, DialogStatus, Message as DbMessage
+    from app.database.models import Complaint, Dialog, DialogStatus
+    from app.database.models import Message as DbMessage
 
     first = await make_user(8601)
     second = await make_user(8602)
@@ -414,3 +415,17 @@ async def test_complaint_card_survives_html_in_user_text(bot, dispatcher, sessio
     text = bot.session.last_text()
     assert "&lt;b&gt;" in text, "user text must be escaped for parse_mode=HTML"
     assert "<b>злой</b>" not in text
+
+
+@pytest.mark.asyncio
+async def test_registration_does_not_leave_stale_buttons(bot, dispatcher):
+    """After the gender step the previous keyboard must disappear, not linger."""
+    await send_text(bot, dispatcher, 8701, "/start")
+    await press(bot, dispatcher, 8701, "consent:accept")
+    await press(bot, dispatcher, 8701, "reg:gender:male")
+
+    assert "Шаг 2" in bot.session.last_text()
+    assert bot.session.markup_buttons() == [], "step 1 buttons stayed on the birth-date screen"
+
+    await send_text(bot, dispatcher, 8701, "14.05.1998")
+    assert "reg:city:global" in bot.session.markup_buttons()

@@ -3,7 +3,12 @@ from __future__ import annotations
 import logging
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from redis.asyncio import Redis
 
 from app.redis import keys
@@ -40,10 +45,15 @@ async def edit_ui(
     text: str,
     kb: InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None,
 ) -> Message | None:
-    """Edit the single bot message that carries the current screen."""
+    """Edit the single bot message that carries the current screen.
+
+    `kb=None` means "no buttons": Telegram keeps the previous inline keyboard when
+    reply_markup is omitted, which left dead step-1 buttons under the next screen.
+    """
     mid = await get_ui_message_id(redis, tg_id)
     if mid:
-        ok = await safe_edit_message_text(bot, tg_id, mid, text, reply_markup=kb, parse_mode=PARSE_MODE)
+        markup = kb if kb is not None else InlineKeyboardMarkup(inline_keyboard=[])
+        ok = await safe_edit_message_text(bot, tg_id, mid, text, reply_markup=markup, parse_mode=PARSE_MODE)
         if ok:
             return None
         # The message is gone (deleted, too old, media): fall through to a new one.
