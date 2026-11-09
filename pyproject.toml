@@ -1,6 +1,9 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# `pytest` (console script) does not put the repo root on sys.path, only
+# `python -m pytest` does — CI ran the former and failed on `import app`.
+pythonpath = ["."]
 addopts = "-q --strict-markers"
 filterwarnings = [
     "ignore::DeprecationWarning",
