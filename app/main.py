@@ -6,6 +6,7 @@ import logging
 import secrets
 import signal
 import sys
+import time
 import warnings
 
 import aiohttp
@@ -284,6 +285,7 @@ async def run() -> int:
     backoff = 1
     try:
         while True:
+            session_started_at = time.monotonic()
             polling = asyncio.create_task(
                 dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
             )
@@ -321,6 +323,10 @@ async def run() -> int:
                 with contextlib.suppress(BaseException):
                     await waiter
 
+            # Only grow the delay for genuinely quick failures: after hours of
+            # healthy polling the next blip should retry in a second, not a minute.
+            if time.monotonic() - session_started_at > 120:
+                backoff = 1
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
     finally:

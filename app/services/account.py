@@ -70,6 +70,8 @@ async def clear_user_cache(redis: Redis, tg_id: int) -> None:
             keys.premium_pref_key(tg_id),
             keys.last_partner(tg_id),
             keys.online_key(tg_id),
+            keys.seen_key(tg_id),
+            keys.ban_flag_key(tg_id),
         ):
             pipe.delete(key)
         await pipe.execute()
