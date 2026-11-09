@@ -2,21 +2,18 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-SCALE = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+# 1..10 — no "0": a zero reads as "not rated at all" and the lowest honest score
+# people mean is 1. Two rows of five keep every value one tap away.
+SCALE = tuple(range(1, 11))
 
 
 def rating_kb(prefix: str) -> InlineKeyboardMarkup:
-    """All eleven values 0..10 as buttons.
-
-    The previous layout used two rows of five, so **10 was unreachable** — the top
-    of the scale only existed for people who guessed they could type it.
-    """
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(text=str(value), callback_data=f"{prefix}:{value}")
-            for value in SCALE[start : start + 6]
+            for value in SCALE[start : start + 5]
         ]
-        for start in (0, 6)
+        for start in (0, 5)
     ]
     rows.append([InlineKeyboardButton(text="Пропустить", callback_data="rate:skip")])
     rows.append([InlineKeyboardButton(text="🚨 Пожаловаться", callback_data="complaint:start")])

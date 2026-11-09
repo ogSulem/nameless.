@@ -60,6 +60,21 @@ async def _clear_pending(redis: Redis, tg_id: int) -> None:
     await clear_rating(redis, tg_id)
 
 
+async def _face_photo_seen(redis: Redis, tg_id: int, dialog_id: int, state: dict) -> bool:
+    """Did this user receive a photo where the detector found a person?
+
+    The check runs in the background right after the photo is relayed, so a dialog
+    finished a second later may not have the flag yet: ask Redis again at the
+    moment the appearance question would be shown.
+    """
+    if state.get("has_photos") == "1":
+        return True
+    try:
+        return bool(await redis.get(keys.appearance_rating_required(tg_id, dialog_id)))
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------------- saving
 async def _save_rating(
     session: AsyncSession,
@@ -154,8 +169,8 @@ async def rate_callback(
     except ValueError:
         await safe_answer_callback(call, "Некорректная оценка")
         return
-    if not 0 <= value <= 10:
-        await safe_answer_callback(call, "Оценка от 0 до 10")
+    if not 1 <= value <= 10:
+        await safe_answer_callback(call, "Оценка от 1 до 10")
         return
 
     state = await _pending(redis, tg_id)
@@ -164,7 +179,9 @@ async def rate_callback(
         await safe_answer_callback(call)
         return
 
-    if not await rate_limit(redis, key=keys.rate(f"rate:{tg_id}"), ttl_s=2):
+    # Per step: a quick second tap on the *appearance* scale must not be throttled
+    # by the chat score the user tapped a moment earlier.
+    if not await rate_limit(redis, key=keys.rate(f"rate:{tg_id}:{step}"), ttl_s=2):
         await safe_answer_callback(call, "Секунду…")
         return
 
@@ -179,7 +196,7 @@ async def rate_callback(
     )
     await safe_answer_callback(call, "Оценка принята" if ok else "Вы уже оценили")
 
-    if step == "chat" and state.get("has_photos") == "1":
+    if step == "chat" and await _face_photo_seen(redis, tg_id, dialog_id, state):
         try:
             await redis.set(keys.pending_rating_step(tg_id), "appearance", ex=60 * 60)
         except Exception:
@@ -187,7 +204,7 @@ async def rate_callback(
         await edit_ui(
             call.bot, redis, tg_id,
             "📸 <b>А теперь внешность собеседника</b>\n\n"
-            "Собеседник присылал фото человека — поставьте оценку от 0 до 10.\n"
+            "Собеседник присылал фото человека — поставьте оценку от 1 до 10.\n"
             "<i>Оценка анонимна, её увидит только рейтинг.</i>",
             kb=rating_kb("rate:app"),
         )
@@ -206,7 +223,7 @@ async def rate_skip(call: CallbackQuery, session: AsyncSession, redis: Redis, se
     await _finish_rating(call.bot, session, redis, settings, tg_id, str(state.get("action") or "end"))
 
 
-@router.message(F.text.regexp(r"^\s*(10|[0-9])\s*$"))
+@router.message(F.text.regexp(r"^\s*(10|[1-9])\s*$"))
 async def rating_by_text(
     message: Message, session: AsyncSession, redis: Redis, settings: Settings
 ) -> None:
@@ -223,7 +240,7 @@ async def rating_by_text(
     except Exception:
         pass
 
-    value = int((message.text or "0").strip())
+    value = int((message.text or "1").strip())
     step = "app" if state.get("step") == "appearance" else "chat"
     rating_type = RatingType.chat if step == "chat" else RatingType.appearance
     await _save_rating(
@@ -232,14 +249,14 @@ async def rating_by_text(
         rating_type=rating_type, value=value,
     )
 
-    if step == "chat" and state.get("has_photos") == "1":
+    if step == "chat" and await _face_photo_seen(redis, tg_id, int(state["dialog_id"]), state):
         try:
             await redis.set(keys.pending_rating_step(tg_id), "appearance", ex=60 * 60)
         except Exception:
             pass
         await edit_ui(
             message.bot, redis, tg_id,
-            "📸 Теперь оцените внешность (0–10) или нажмите «Пропустить».",
+            "📸 Теперь оцените внешность (1–10) или нажмите «Пропустить».",
             kb=rating_kb("rate:app"),
         )
         return

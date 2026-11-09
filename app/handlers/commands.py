@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import Gender, User
-from app.flows.profile import age_of, show_profile
+from app.flows.profile import age_of, birth_date_from_age, show_profile
 from app.flows.states import ProfileEdit, Registration
 from app.keyboards.profile import delete_confirm_kb, legal_kb
 from app.keyboards.start import back_kb, city_kb, consent_kb, gender_kb, seek_gender_kb
@@ -46,6 +46,17 @@ def parse_birth_date(raw: str) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def parse_age(raw: str) -> int | None:
+    """Accept `25` — and, out of politeness, a birth date from people who type one."""
+    text = (raw or "").strip()
+    if text.isdigit() and len(text) <= 3:
+        return int(text)
+    birth = parse_birth_date(text)
+    if birth is None:
+        return None
+    return age_of(birth)
 
 
 async def caretaker_purge(bot: Bot, session: AsyncSession, redis: Redis, settings: Settings, tg_id: int) -> None:
@@ -152,7 +163,7 @@ async def cmd_start(
             return
 
         current = await state.get_state()
-        if current in {Registration.gender.state, Registration.birth_date.state,
+        if current in {Registration.gender.state, Registration.age.state,
                        Registration.city.state, Registration.seek.state}:
             # User already registered but the flow was interrupted: just finish it.
             await state.clear()
@@ -223,47 +234,46 @@ async def reg_gender(call: CallbackQuery, state: FSMContext, redis: Redis) -> No
         await safe_answer_callback(call, "Некорректный выбор")
         return
     await state.update_data(gender=gender)
-    await state.set_state(Registration.birth_date)
+    await state.set_state(Registration.age)
     await edit_ui(
         call.bot,
         redis,
         int(call.from_user.id),
-        "<b>Шаг 2 из 4.</b> Дата рождения?\n\n"
-        "Формат: <code>ДД.ММ.ГГГГ</code>, например <code>14.05.1998</code>.\n"
-        "<i>Нужна только для возраста — другие видят лишь число лет.</i>",
+        "<b>Шаг 2 из 4.</b> Сколько вам лет?\n\n"
+        "Напишите числом, например <code>25</code>.\n\n"
+        "<i>Другие видят только число лет, дату рождения мы не спрашиваем.</i>",
     )
     await safe_answer_callback(call)
 
 
-@router.message(Registration.birth_date)
-async def reg_birth_date(message: Message, state: FSMContext, redis: Redis, settings: Settings) -> None:
+@router.message(Registration.age)
+async def reg_age(message: Message, state: FSMContext, redis: Redis, settings: Settings) -> None:
     tg_id = int(message.from_user.id)
     await _delete(message)
 
-    birth = parse_birth_date(message.text or "")
-    if birth is None:
+    age = parse_age(message.text or "")
+    if age is None:
         await edit_ui(
             message.bot, redis, tg_id,
-            "Не похоже на дату 🤔\n\nВведите в формате <code>ДД.ММ.ГГГГ</code>, например <code>14.05.1998</code>.",
+            "Не похоже на возраст 🤔\n\nНапишите число, например <code>25</code>.",
         )
         return
 
-    age = age_of(birth)
     if age < settings.min_age:
         await edit_ui(
             message.bot, redis, tg_id,
             f"🚫 Сервис доступен только с {settings.min_age} лет.\n\n"
-            "Если ошиблись — введите дату заново в формате <code>ДД.ММ.ГГГГ</code>.",
+            f"Если ошиблись — напишите возраст ещё раз (например, <code>{settings.min_age}</code>).",
         )
         return
     if age > 99:
         await edit_ui(
             message.bot, redis, tg_id,
-            "Проверьте дату — кажется, там опечатка. Формат: <code>ДД.ММ.ГГГГ</code>.",
+            "Проверьте возраст — кажется, там опечатка. Напишите число, например <code>25</code>.",
         )
         return
 
-    await state.update_data(birth_date=birth.isoformat())
+    await state.update_data(age=age)
     await state.set_state(Registration.city)
     await edit_ui(
         message.bot, redis, tg_id,
@@ -334,7 +344,7 @@ async def reg_seek(
     data = await state.get_data()
     try:
         gender = str(data["gender"])
-        birth_date = datetime.fromisoformat(str(data["birth_date"])).date()
+        birth_date = birth_date_from_age(int(data["age"]))
     except (KeyError, ValueError):
         await state.clear()
         await send_new_ui(call.bot, redis, tg_id, "Сессия регистрации истекла. Нажмите /start.")

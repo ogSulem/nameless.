@@ -61,6 +61,7 @@ class FakeSession(BaseSession):
         self._next_id = 1000
         # Chats where the bot is blocked: every send fails like real Telegram does.
         self.blocked_chats: set[int] = set()
+        self.chat_actions: list[tuple[int, str]] = []
 
     async def close(self) -> None:  # pragma: no cover - nothing to close
         return None
@@ -127,6 +128,7 @@ class FakeSession(BaseSession):
             self.answers.append(method.text)
             return True
         if isinstance(method, SendChatAction):
+            self.chat_actions.append((method.chat_id, method.action))
             return True
         if isinstance(method, CreateInvoiceLink):
             self.invoices.append(method)

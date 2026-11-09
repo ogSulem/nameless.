@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 def partner_card(partner: User) -> str:
     gender = "👦 парень" if partner.gender.value == "male" else "👧 девушка"
-    city = escape(partner.city) if partner.city else "🌍 вся страна"
+    location = f"🏙 {escape(partner.city)}" if partner.city else "🌍 вся страна"
 
     if int(partner.chat_ratings_count or 0) == 0:
         rating = "⭐ рейтинг: новый собеседник"
@@ -34,7 +34,7 @@ def partner_card(partner: User) -> str:
         "🔗 <b>Собеседник найден</b>",
         "",
         f"{gender}, {age_of(partner.birth_date)}",
-        f"🏙 {city}",
+        location,
         rating,
     ]
     if premium_active(partner):

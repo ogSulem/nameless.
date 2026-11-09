@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database.models import Dialog, DialogStatus, Gender, Payment, Rating, RatingType, User
 from app.redis import keys
@@ -119,7 +119,7 @@ async def test_profile_shows_whom_you_are_looking_for(bot, dispatcher, session):
     await send_text(bot, dispatcher, 7001, "/start")
     await press(bot, dispatcher, 7001, "consent:accept")
     await press(bot, dispatcher, 7001, "reg:gender:male")
-    await send_text(bot, dispatcher, 7001, "14.05.1998")
+    await send_text(bot, dispatcher, 7001, "28")
     await press(bot, dispatcher, 7001, "reg:city:global")
     await press(bot, dispatcher, 7001, "reg:seek:female")
 
@@ -158,7 +158,7 @@ async def test_blocked_partner_keeps_the_rating_screen(bot, dispatcher, session,
     await send_text(bot, dispatcher, 7201, "/start")
     await press(bot, dispatcher, 7201, "consent:accept")
     await press(bot, dispatcher, 7201, "reg:gender:male")
-    await send_text(bot, dispatcher, 7201, "14.05.1998")
+    await send_text(bot, dispatcher, 7201, "28")
     await press(bot, dispatcher, 7201, "reg:city:global")
     await press(bot, dispatcher, 7201, "reg:seek:female")
 
@@ -186,7 +186,7 @@ async def test_unsupported_message_inside_dialog_gets_a_hint(bot, dispatcher, se
     await send_text(bot, dispatcher, 7301, "/start")
     await press(bot, dispatcher, 7301, "consent:accept")
     await press(bot, dispatcher, 7301, "reg:gender:male")
-    await send_text(bot, dispatcher, 7301, "14.05.1998")
+    await send_text(bot, dispatcher, 7301, "28")
     await press(bot, dispatcher, 7301, "reg:city:global")
     await press(bot, dispatcher, 7301, "reg:seek:female")
 
@@ -364,7 +364,7 @@ async def test_ban_closes_the_dialog_of_the_partner(bot, dispatcher, session, re
     await send_text(bot, dispatcher, 8501, "/start")
     await press(bot, dispatcher, 8501, "consent:accept")
     await press(bot, dispatcher, 8501, "reg:gender:male")
-    await send_text(bot, dispatcher, 8501, "14.05.1998")
+    await send_text(bot, dispatcher, 8501, "28")
     await press(bot, dispatcher, 8501, "reg:city:global")
     await press(bot, dispatcher, 8501, "reg:seek:female")
 
@@ -427,7 +427,7 @@ async def test_registration_does_not_leave_stale_buttons(bot, dispatcher):
     assert "Шаг 2" in bot.session.last_text()
     assert bot.session.markup_buttons() == [], "step 1 buttons stayed on the birth-date screen"
 
-    await send_text(bot, dispatcher, 8701, "14.05.1998")
+    await send_text(bot, dispatcher, 8701, "28")
     assert "reg:city:global" in bot.session.markup_buttons()
 
 
@@ -444,7 +444,7 @@ async def test_typed_number_does_not_rate_after_leaving_the_screen(
     await send_text(bot, dispatcher, 8801, "/start")
     await press(bot, dispatcher, 8801, "consent:accept")
     await press(bot, dispatcher, 8801, "reg:gender:male")
-    await send_text(bot, dispatcher, 8801, "14.05.1998")
+    await send_text(bot, dispatcher, 8801, "28")
     await press(bot, dispatcher, 8801, "reg:city:global")
     await press(bot, dispatcher, 8801, "reg:seek:female")
 
@@ -464,3 +464,121 @@ async def test_typed_number_does_not_rate_after_leaving_the_screen(
     ratings = int((await session.execute(select(func.count(Rating.id)))).scalar_one())
     assert ratings == 0, "a stray number in the profile must not rate anyone"
     assert (await session.execute(select(ActiveDialog))).scalars().all() == []
+
+
+# ------------------------------------------------------------------ rating scale
+def test_rating_scale_is_one_to_ten():
+    """1..10 — "0" is not an opinion, it is a mis-tap."""
+    from app.keyboards.rating import SCALE, rating_kb
+
+    assert tuple(range(1, 11)) == SCALE
+    values = [b.callback_data for row in rating_kb("rate:chat").inline_keyboard for b in row]
+    assert "rate:chat:0" not in values
+    assert [v for v in values if v.startswith("rate:chat:")] == [f"rate:chat:{i}" for i in range(1, 11)]
+
+
+@pytest.mark.asyncio
+async def test_zero_is_not_a_rating_anywhere(bot, dispatcher, session, redis, settings, make_user):
+    await _open_dialog(bot, dispatcher, session, redis, settings, 7501, 7502)
+
+    await press(bot, dispatcher, 7501, "rate:chat:0")
+    assert "от 1 до 10" in " ".join(a for a in bot.session.answers if a)
+
+    # Typing "0" must fall through to the ordinary handler, not create a rating.
+    await send_text(bot, dispatcher, 7501, "0")
+    await session.commit()
+    count = (await session.execute(select(func.count(Rating.id)))).scalar_one()
+    assert count == 0
+
+
+async def _open_dialog(bot, dispatcher, session, redis, settings, me: int, partner: int) -> int:
+    """Register `me`, pair with a fresh partner and return the dialog id."""
+    from app.services.dialog import DialogService
+
+    await send_text(bot, dispatcher, me, "/start")
+    await press(bot, dispatcher, me, "consent:accept")
+    await press(bot, dispatcher, me, "reg:gender:male")
+    await send_text(bot, dispatcher, me, "28")
+    await press(bot, dispatcher, me, "reg:city:global")
+    await press(bot, dispatcher, me, "reg:seek:female")
+
+    other = await make_user_fixture(session, partner)
+    await MatchmakingService(redis, settings).enqueue(session, other)
+    await press(bot, dispatcher, me, "search:start")
+    dialog_id = await DialogService(redis, settings).active_dialog_id(session, me)
+    assert dialog_id
+    return int(dialog_id)
+
+
+async def make_user_fixture(session, tg_id: int):
+    user = User(
+        telegram_id=tg_id,
+        gender=Gender.female,
+        birth_date=date(1996, 3, 3),
+        city=None,
+        seek_gender="male",
+        is_banned=False,
+    )
+    session.add(user)
+    await session.commit()
+    return user
+
+
+# ------------------------------------------------- appearance rating is earned
+@pytest.mark.asyncio
+async def test_photo_without_a_person_does_not_unlock_the_appearance_rating(
+    bot, dispatcher, session, redis, settings, make_user
+):
+    """`has_photos` alone is not enough — a screenshot or a cat is not a face."""
+    dialog_id = await _open_dialog(bot, dispatcher, session, redis, settings, 7503, 7504)
+    dialog = await session.get(Dialog, dialog_id)
+    dialog.has_photos = True
+    await session.commit()
+
+    await send_text(bot, dispatcher, 7503, "Спасибо за общение")
+    await send_text(bot, dispatcher, 7503, "🛑 Завершить")
+    await press(bot, dispatcher, 7503, "rate:chat:9")
+
+    assert "внешность" not in bot.session.last_text().lower()
+    assert not any(b.startswith("rate:app:") for b in bot.session.markup_buttons())
+
+
+@pytest.mark.asyncio
+async def test_face_flag_arriving_late_still_unlocks_the_appearance_rating(
+    bot, dispatcher, session, redis, settings, make_user
+):
+    """The detector runs in the background: its verdict may land after the dialog ends."""
+    dialog_id = await _open_dialog(bot, dispatcher, session, redis, settings, 7505, 7506)
+    await redis.set(keys.appearance_rating_required(7505, dialog_id), "1", ex=3600)
+
+    await send_text(bot, dispatcher, 7505, "🛑 Завершить")
+    await press(bot, dispatcher, 7505, "rate:chat:9")
+
+    assert "внешность" in bot.session.last_text().lower()
+    assert any(b.startswith("rate:app:") for b in bot.session.markup_buttons())
+
+    await press(bot, dispatcher, 7505, "rate:app:8")
+    ratings = (await session.execute(select(Rating))).scalars().all()
+    assert {(r.rating_type, r.value) for r in ratings} == {
+        (RatingType.chat, 9),
+        (RatingType.appearance, 8),
+    }
+
+
+@pytest.mark.asyncio
+async def test_partner_sees_a_typing_indicator(bot, dispatcher, session, redis, settings, make_user):
+    """A relay without "is typing…" feels like shouting into a void."""
+    import asyncio
+
+    await _open_dialog(bot, dispatcher, session, redis, settings, 7601, 7602)
+
+    await send_text(bot, dispatcher, 7601, "привет")
+    await asyncio.sleep(0.05)
+    assert (7602, "typing") in bot.session.chat_actions
+
+    # Throttled: a burst of messages must not turn into a burst of API calls.
+    before = len(bot.session.chat_actions)
+    for text in ("как дела", "что нового", "ну как"):
+        await send_text(bot, dispatcher, 7601, text)
+        await asyncio.sleep(0.02)
+    assert len(bot.session.chat_actions) == before

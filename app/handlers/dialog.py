@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from datetime import UTC, datetime
 
@@ -249,6 +248,11 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         await _notice(message.bot, redis, tg_id, "Сообщение не доставлено. Попробуйте ещё раз.")
         return
 
+    # Only after a successful delivery: "typing…" next to nothing would be a lie.
+    background(_typing(
+        message.bot, redis, info.partner_telegram_id, "upload_photo" if message.photo else "typing"
+    ))
+
     await svc.heartbeat(info)
     await _delete(message)
 
@@ -257,11 +261,32 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
             await svc.save_text(session, dialog_id, info.me_db_id, message.text[:4096])
         elif message.photo:
             await svc.save_photo(session, dialog_id, info.me_db_id, message.photo[-1].file_id)
-            asyncio.create_task(
+            background(
                 _photo_pipeline(message.bot, redis, settings, info, message.photo[-1].file_id, tg_id)
             )
     except Exception:
         logger.exception("relay_persist_failed dialog_id=%s", dialog_id)
+
+
+# Fire-and-forget helpers (face check, delayed notice cleanup). The event loop
+# keeps only a weak reference to a bare task, so a long download or a sleeping
+# cleanup could in theory be garbage-collected mid-flight.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def _mark_face_seen(redis: Redis, info: DialogInfo) -> None:
+    try:
+        await redis.set(
+            keys.appearance_rating_required(info.partner_telegram_id, info.dialog_id), "1", ex=3600
+        )
+    except Exception:
+        logger.warning("face_flag_failed dialog_id=%s", info.dialog_id)
 
 
 async def _photo_pipeline(
@@ -276,32 +301,24 @@ async def _photo_pipeline(
     cache_key = keys.sender_human_detected(info.dialog_id, sender_tg)
     try:
         if await redis.get(cache_key):
-            await redis.set(keys.appearance_rating_required(info.partner_telegram_id, info.dialog_id), "1", ex=3600)
+            await _mark_face_seen(redis, info)
             return
 
         detector = FaceDetector.shared(settings)
         if not detector.available:
             return
 
-        buffer = io.BytesIO()
-        try:
-            await asyncio.wait_for(bot.download(file_id, destination=buffer), timeout=float(settings.vision_timeout_s))
-        except Exception:
-            logger.info("photo_download_failed dialog_id=%s", info.dialog_id)
-            return
-
-        verdict = await detector.has_face(buffer.getvalue())
+        verdict = await detector.check_telegram_photo(bot, file_id)
         logger.info(
             "face_verdict dialog_id=%s from=%s has_face=%s backend=%s faces=%s ms=%s",
             info.dialog_id, sender_tg, verdict.has_face, verdict.backend, verdict.faces, verdict.ms,
         )
         if verdict.has_face:
-            await redis.set(cache_key, "1", ex=3600)
-            await redis.set(
-                keys.appearance_rating_required(info.partner_telegram_id, info.dialog_id), "1", ex=3600
-            )
-    except asyncio.TimeoutError:
-        logger.info("photo_pipeline_timeout dialog_id=%s", info.dialog_id)
+            try:
+                await redis.set(cache_key, "1", ex=3600)
+            except Exception:
+                pass
+            await _mark_face_seen(redis, info)
     except Exception:
         logger.exception("photo_pipeline_failed dialog_id=%s", info.dialog_id)
 
@@ -332,7 +349,21 @@ async def _notice(bot: Bot, redis: Redis, tg_id: int, text: str) -> None:
         logger.info("notice_failed tg=%s", tg_id)
         return
     if msg is not None:
-        asyncio.create_task(_delete_later(bot, tg_id, msg.message_id, NOTICE_TTL_S))
+        background(_delete_later(bot, tg_id, msg.message_id, NOTICE_TTL_S))
+
+
+async def _typing(bot: Bot, redis: Redis, partner_tg: int, action: str = "typing") -> None:
+    """Show the partner "is typing…" — the cheapest way to make a relay feel alive.
+
+    Throttled to one action per 4 seconds per chat and never allowed to break the
+    relay itself.
+    """
+    try:
+        if not await rate_limit(redis, key=keys.rate(f"typing:{partner_tg}"), ttl_s=4):
+            return
+        await bot.send_chat_action(chat_id=partner_tg, action=action)
+    except Exception:
+        logger.debug("chat_action_failed tg=%s", partner_tg)
 
 
 async def _delete_later(bot: Bot, tg_id: int, message_id: int, delay: float) -> None:

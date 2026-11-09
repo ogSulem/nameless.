@@ -1,6 +1,6 @@
 """Pending-rating state.
 
-The rating flow spans two updates (dialog finished → user taps 0–10), so the
+The rating flow spans two updates (dialog finished → user taps 1–10), so the
 "who am I rating" data lives in Redis with a TTL. It is deliberately cleared as
 soon as the profile screen is shown: a bare "5" typed in the profile must never
 silently rate somebody from a dialog that ended minutes ago.

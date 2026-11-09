@@ -6,7 +6,7 @@ from aiogram.fsm.state import State, StatesGroup
 class Registration(StatesGroup):
     consent = State()
     gender = State()
-    birth_date = State()
+    age = State()
     city = State()
     seek = State()
 

@@ -24,6 +24,21 @@ def age_of(birth_date: date) -> int:
     return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
 
 
+def birth_date_from_age(age: int) -> date:
+    """Turn the age a person typed into a birth date.
+
+    Registration asks for the age (that is the number the product shows), but the
+    column stays a real date, so the stored age keeps moving with the calendar
+    instead of freezing on the day of sign-up. 29 Feb degrades to 28 Feb in
+    non-leap years.
+    """
+    today = datetime.now(tz=UTC).date()
+    try:
+        return today.replace(year=today.year - int(age))
+    except ValueError:
+        return date(today.year - int(age), 2, 28)
+
+
 def premium_active(user: User) -> bool:
     if user.subscription_until is None:
         return False
@@ -94,7 +109,7 @@ async def show_profile(
         await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return
 
-    # Showing the profile means "not rating anymore": the 0–10 screen is gone,
+    # Showing the profile means "not rating anymore": the 1–10 screen is gone,
     # so a typed number must not be treated as an anonymous rating.
     await clear_rating(redis, tg_id)
 

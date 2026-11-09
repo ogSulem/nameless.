@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 from sqlalchemy import func, select
 
@@ -8,11 +10,11 @@ from app.database.models import Message as DbMessage
 from tests.conftest import press, send_text
 
 
-async def _register(bot, dispatcher, tg_id: int, *, gender="male", birthday="14.05.1998", city=None):
+async def _register(bot, dispatcher, tg_id: int, *, gender="male", age="28", city=None):
     await send_text(bot, dispatcher, tg_id, "/start")
     await press(bot, dispatcher, tg_id, "consent:accept")
     await press(bot, dispatcher, tg_id, f"reg:gender:{gender}")
-    await send_text(bot, dispatcher, tg_id, birthday)
+    await send_text(bot, dispatcher, tg_id, age)
     if city is None:
         await press(bot, dispatcher, tg_id, "reg:city:global")
     else:
@@ -28,7 +30,7 @@ async def test_full_journey(bot, dispatcher, session, make_user):
 
     await press(bot, dispatcher, 9001, "consent:accept")
     await press(bot, dispatcher, 9001, "reg:gender:male")
-    await send_text(bot, dispatcher, 9001, "14.05.1998")
+    await send_text(bot, dispatcher, 9001, "28")
     await send_text(bot, dispatcher, 9001, "Москва")
     await press(bot, dispatcher, 9001, "reg:seek:female")
 
@@ -87,7 +89,7 @@ async def test_underage_registration_is_refused(bot, dispatcher, session):
     await send_text(bot, dispatcher, 9020, "/start")
     await press(bot, dispatcher, 9020, "consent:accept")
     await press(bot, dispatcher, 9020, "reg:gender:male")
-    await send_text(bot, dispatcher, 9020, "01.01.2015")
+    await send_text(bot, dispatcher, 9020, "12")
 
     assert "18" in bot.session.last_text()
     user = (await session.execute(select(User).where(User.telegram_id == 9020))).scalar_one_or_none()
@@ -95,16 +97,53 @@ async def test_underage_registration_is_refused(bot, dispatcher, session):
 
 
 @pytest.mark.asyncio
-async def test_garbage_birth_date_keeps_the_flow_alive(bot, dispatcher, session):
-    """Regression: the old flow dead-ended on a bad date."""
+async def test_garbage_age_keeps_the_flow_alive(bot, dispatcher, session):
+    """Regression: the old flow dead-ended on a bad answer."""
     await send_text(bot, dispatcher, 9030, "/start")
     await press(bot, dispatcher, 9030, "consent:accept")
     await press(bot, dispatcher, 9030, "reg:gender:female")
     await send_text(bot, dispatcher, 9030, "не дата")
-    assert "ДД.ММ.ГГГГ" in bot.session.last_text()
+    assert "возраст" in bot.session.last_text().lower()
 
-    await send_text(bot, dispatcher, 9030, "01.01.1999")
+    await send_text(bot, dispatcher, 9030, "27")
     assert "город" in bot.session.last_text().lower()
+
+
+@pytest.mark.asyncio
+async def test_age_is_what_we_ask_and_what_we_store(bot, dispatcher, session):
+    """The step asks for the age, and the stored date keeps that age today."""
+    from app.flows.profile import age_of
+
+    await send_text(bot, dispatcher, 9050, "/start")
+    await press(bot, dispatcher, 9050, "consent:accept")
+    await press(bot, dispatcher, 9050, "reg:gender:male")
+    assert "Сколько вам лет" in bot.session.last_text()
+
+    await send_text(bot, dispatcher, 9050, "31")
+    await press(bot, dispatcher, 9050, "reg:city:global")
+    await press(bot, dispatcher, 9050, "reg:seek:any")
+
+    user = (await session.execute(select(User).where(User.telegram_id == 9050))).scalar_one()
+    assert age_of(user.birth_date) == 31
+    assert "31" in bot.session.last_text()
+
+
+@pytest.mark.asyncio
+async def test_birth_date_typed_instead_of_age_is_understood(bot, dispatcher, session):
+    """People who type a date out of habit must not hit a wall."""
+    from app.flows.profile import age_of
+
+    await send_text(bot, dispatcher, 9060, "/start")
+    await press(bot, dispatcher, 9060, "consent:accept")
+    await press(bot, dispatcher, 9060, "reg:gender:male")
+    await send_text(bot, dispatcher, 9060, "14.05.1998")
+    assert "город" in bot.session.last_text().lower()
+
+    await press(bot, dispatcher, 9060, "reg:city:global")
+    await press(bot, dispatcher, 9060, "reg:seek:any")
+
+    user = (await session.execute(select(User).where(User.telegram_id == 9060))).scalar_one()
+    assert age_of(user.birth_date) == age_of(date(1998, 5, 14))
 
 
 @pytest.mark.asyncio

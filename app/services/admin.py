@@ -178,6 +178,26 @@ async def find_user(session: AsyncSession, arg: int) -> User | None:
     return None
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _ratings_detail(count: int, last_20: float) -> str:
+    """`(12 оценок, 6.10 за 20)` — the recent average only when there is one."""
+    n = int(count or 0)
+    if n <= 0:
+        return "(оценок нет)"
+    word = _plural(n, "оценка", "оценки", "оценок")
+    if float(last_20 or 0) > 0:
+        return f"({n} {word}, {float(last_20):.2f} за 20)"
+    return f"({n} {word})"
+
+
 def age_of(birth) -> int:
     """Whole years between `birth` (date or datetime) and today, UTC."""
     today = utcnow().date()
@@ -246,9 +266,9 @@ async def user_card(
         f"📍 {escape(user.city or 'вся страна')}",
         f"🔎 Ищет: {escape(intent or '—')}",
         f"⭐ Рейтинг: <b>{user.season_rating_chat:.2f}</b> "
-        f"({user.chat_ratings_count} оценок, {user.last_20_avg_chat:.2f} за 20)",
+        f"{_ratings_detail(user.chat_ratings_count, user.last_20_avg_chat)}",
         f"🖼 Внешность: <b>{user.season_rating_appearance:.2f}</b> "
-        f"({user.appearance_ratings_count} оценок, {user.last_20_avg_appearance:.2f} за 20)",
+        f"{_ratings_detail(user.appearance_ratings_count, user.last_20_avg_appearance)}",
         "",
         f"📅 Регистрация: {user.created_at:%d.%m.%Y}" if user.created_at else "📅 —",
         f"👀 Был(а): {last_seen:%d.%m %H:%M} UTC" if last_seen else "👀 —",
