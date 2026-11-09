@@ -429,3 +429,38 @@ async def test_registration_does_not_leave_stale_buttons(bot, dispatcher):
 
     await send_text(bot, dispatcher, 8701, "14.05.1998")
     assert "reg:city:global" in bot.session.markup_buttons()
+
+
+@pytest.mark.asyncio
+async def test_typed_number_does_not_rate_after_leaving_the_screen(
+    bot, dispatcher, session, redis, settings, make_user
+):
+    """`/stop` shows the profile but used to leave the pending rating alive."""
+    from sqlalchemy import func
+
+    from app.database.models import ActiveDialog, Rating
+    from app.services.matchmaking import MatchmakingService
+
+    await send_text(bot, dispatcher, 8801, "/start")
+    await press(bot, dispatcher, 8801, "consent:accept")
+    await press(bot, dispatcher, 8801, "reg:gender:male")
+    await send_text(bot, dispatcher, 8801, "14.05.1998")
+    await press(bot, dispatcher, 8801, "reg:city:global")
+    await press(bot, dispatcher, 8801, "reg:seek:female")
+
+    partner = await make_user(8802, gender=Gender.female, city=None)
+    partner.seek_gender = "male"
+    await session.commit()
+    await MatchmakingService(redis, settings).enqueue(session, partner)
+    await press(bot, dispatcher, 8801, "search:start")
+
+    # /stop leaves the flow without rating; the partner's prompt must stay live.
+    await send_text(bot, dispatcher, 8801, "/stop")
+    assert "Профиль" in bot.session.last_text()
+
+    await send_text(bot, dispatcher, 8801, "5")
+    await session.commit()
+
+    ratings = int((await session.execute(select(func.count(Rating.id)))).scalar_one())
+    assert ratings == 0, "a stray number in the profile must not rate anyone"
+    assert (await session.execute(select(ActiveDialog))).scalars().all() == []

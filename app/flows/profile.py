@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import User
+from app.flows.pending import clear_rating
 from app.keyboards.profile import profile_kb
 from app.services.matchmaking import MatchmakingService, normalize_seek
 from app.ui import edit_ui, send_new_ui
@@ -92,6 +93,10 @@ async def show_profile(
     if user is None:
         await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return
+
+    # Showing the profile means "not rating anymore": the 0–10 screen is gone,
+    # so a typed number must not be treated as an anonymous rating.
+    await clear_rating(redis, tg_id)
 
     is_premium = premium_active(user)
     mode = "chat"

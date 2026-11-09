@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import Rating, RatingType
+from app.flows.pending import clear_rating
 from app.flows.profile import show_profile
 from app.flows.states import Complaint
 from app.handlers.commands import get_user
@@ -56,19 +57,7 @@ async def _pending(redis: Redis, tg_id: int) -> dict[str, str | None]:
 
 
 async def _clear_pending(redis: Redis, tg_id: int) -> None:
-    try:
-        pipe = redis.pipeline(transaction=False)
-        for key in (
-            keys.pending_rating(tg_id),
-            keys.pending_rating_partner(tg_id),
-            keys.pending_rating_step(tg_id),
-            keys.pending_rating_has_photos(tg_id),
-            keys.pending_rating_action(tg_id),
-        ):
-            pipe.delete(key)
-        await pipe.execute()
-    except Exception:
-        pass
+    await clear_rating(redis, tg_id)
 
 
 # ------------------------------------------------------------------- saving

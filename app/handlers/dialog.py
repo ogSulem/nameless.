@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database.models import Dialog, User
+from app.flows.pending import RATING_TTL_S
 from app.keyboards.dialog_reply import NEXT, STOP
 from app.keyboards.rating import rating_kb
 from app.redis import keys
@@ -32,7 +33,6 @@ logger = logging.getLogger(__name__)
 router = Router(name="dialog")
 
 _MEDIA_FIELDS = ("photo", "video", "voice", "video_note", "audio", "document", "sticker", "animation")
-RATING_TTL_S = 60 * 60
 
 
 def _has_media(message: Message) -> bool:
