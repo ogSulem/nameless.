@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import Bot
@@ -18,6 +19,50 @@ logger = logging.getLogger(__name__)
 
 UI_TTL_S = 60 * 60 * 24 * 30
 PARSE_MODE = "HTML"
+NOTICE_TTL_S = 8
+
+# Fire-and-forget helpers. The event loop keeps only a weak reference to a bare
+# task, so a sleeping cleanup could in theory be garbage-collected mid-flight.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def notice(
+    bot: Bot,
+    redis: Redis,
+    tg_id: int,
+    text: str,
+    *,
+    ttl_s: float = NOTICE_TTL_S,
+    throttle_s: int = 20,
+) -> None:
+    """A transient line that deletes itself, so the main screen stays untouched."""
+    try:
+        fresh = await redis.set(keys.throttle(f"notice:{int(tg_id)}"), "1", nx=True, ex=int(throttle_s))
+    except Exception:
+        fresh = True
+    if not fresh:
+        return
+    try:
+        msg = await safe_send_message(bot, tg_id, text)
+    except Exception:
+        logger.info("notice_failed tg=%s", tg_id)
+        return
+    if msg is not None:
+        background(_delete_later(bot, tg_id, msg.message_id, ttl_s))
+
+
+async def _delete_later(bot: Bot, tg_id: int, message_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await safe_delete_message(bot, tg_id, message_id)
+    except Exception:
+        logger.debug("notice_cleanup_failed tg=%s", tg_id)
 
 
 async def get_ui_message_id(redis: Redis, tg_id: int) -> int | None:

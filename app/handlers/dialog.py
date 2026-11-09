@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -8,11 +7,10 @@ from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import Message, ReplyKeyboardRemove
 from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database.models import Dialog, User
+from app.database.models import Dialog
 from app.flows.pending import RATING_TTL_S
 from app.keyboards.dialog_reply import NEXT, STOP
 from app.keyboards.rating import rating_kb
@@ -23,9 +21,17 @@ from app.telegram_safe import (
     UserBlockedBot,
     safe_copy_message,
     safe_delete_message,
+    safe_edit_message_reply_markup,
     safe_send_message,
 )
-from app.ui import clear_ui_message_id, edit_ui, get_ui_message_id, set_ui_message_id
+from app.ui import (
+    background,
+    clear_ui_message_id,
+    edit_ui,
+    get_ui_message_id,
+    notice,
+    set_ui_message_id,
+)
 from app.utils.ratelimit import hit, rate_limit
 
 logger = logging.getLogger(__name__)
@@ -85,9 +91,10 @@ async def finish_dialog(
         logger.exception("finish_dialog_state_failed dialog_id=%s", dialog_id)
 
     for tg in telegram_ids:
-        # One card in, one card out: the partner card is removed, and the "dialog
-        # finished" message is immediately reused as the rating screen, so the chat
-        # never accumulates stale bot messages.
+        # One card in, one card out. The rating screen has to be a *new* message:
+        # only a sent message can drop the "⏭️/🛑" reply keyboard (an edit cannot).
+        # Its text therefore goes out complete on the first frame, and the buttons
+        # are attached right after — the user never sees an intermediate screen.
         old_mid = await get_ui_message_id(redis, tg)
         if old_mid:
             await safe_delete_message(bot, tg, old_mid)
@@ -97,7 +104,10 @@ async def finish_dialog(
             msg = await safe_send_message(
                 bot,
                 tg,
-                "🛑 <b>Диалог завершён</b>",
+                (note + "\n\n" if note else "")
+                + "⭐ <b>Насколько комфортным было общение?</b>\n\n"
+                "Оценка анонимна: собеседник не увидит, кто её поставил.\n"
+                "Можно пропустить — тогда просто вернётесь в профиль.",
                 reply_markup=ReplyKeyboardRemove(),
                 parse_mode="HTML",
             )
@@ -109,17 +119,7 @@ async def finish_dialog(
 
         if msg is not None:
             await set_ui_message_id(redis, tg, msg.message_id)
-
-        await edit_ui(
-            bot,
-            redis,
-            tg,
-            (note + "\n\n" if note else "")
-            + "⭐ <b>Насколько комфортным было общение?</b>\n\n"
-            "Оценка анонимна: собеседник не увидит, кто её поставил.\n"
-            "Можно пропустить — тогда просто вернётесь в профиль.",
-            kb=rating_kb("rate:chat"),
-        )
+            await safe_edit_message_reply_markup(bot, tg, msg.message_id, rating_kb("rate:chat"))
 
     logger.info("dialog_finished dialog_id=%s actor=%s action=%s", dialog_id, actor_tg, action)
     return telegram_ids
@@ -181,7 +181,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         # A contact, location or poll: copy_message cannot relay it, and dropping
         # it silently made people think the bot was broken.
         await _delete(message)
-        await _notice(
+        await notice(
             message.bot,
             redis,
             tg_id,
@@ -189,21 +189,21 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         )
         return
 
-    me = await _user(session, tg_id)
     info = await svc.dialog_info(session, dialog_id, tg_id)
-    if me is None or info is None:
+    if info is None or info.me is None:
         raise SkipHandler
+    me = info.me
 
     now = datetime.now(tz=UTC)
     if me.is_banned:
         await _delete(message)
-        await _notice(message.bot, redis, tg_id, "🚫 Аккаунт заблокирован.")
+        await notice(message.bot, redis, tg_id, "🚫 Аккаунт заблокирован.")
         return
     if me.muted_until is not None:
         muted_until = me.muted_until if me.muted_until.tzinfo else me.muted_until.replace(tzinfo=UTC)
         if muted_until > now:
             await _delete(message)
-            await _notice(message.bot, redis, tg_id, "🔇 Отправка сообщений ограничена модерацией.")
+            await notice(message.bot, redis, tg_id, "🔇 Отправка сообщений ограничена модерацией.")
             return
 
     allowed, _ = await hit(
@@ -211,7 +211,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
     )
     if not allowed:
         await _delete(message)
-        await _notice(message.bot, redis, tg_id, "⏳ Слишком быстро. Дайте собеседнику прочитать.")
+        await notice(message.bot, redis, tg_id, "⏳ Слишком быстро. Дайте собеседнику прочитать.")
         return
 
     if message.photo:
@@ -220,7 +220,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         )
         if not photo_allowed:
             await _delete(message)
-            await _notice(message.bot, redis, tg_id, "⏳ Слишком много фото подряд. Подождите минуту.")
+            await notice(message.bot, redis, tg_id, "⏳ Слишком много фото подряд. Подождите минуту.")
             return
 
     try:
@@ -245,7 +245,7 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
         return
     except Exception:
         logger.exception("relay_failed dialog_id=%s from=%s", dialog_id, tg_id)
-        await _notice(message.bot, redis, tg_id, "Сообщение не доставлено. Попробуйте ещё раз.")
+        await notice(message.bot, redis, tg_id, "Сообщение не доставлено. Попробуйте ещё раз.")
         return
 
     # Only after a successful delivery: "typing…" next to nothing would be a lie.
@@ -266,18 +266,6 @@ async def relay_message(message: Message, session: AsyncSession, redis: Redis, s
             )
     except Exception:
         logger.exception("relay_persist_failed dialog_id=%s", dialog_id)
-
-
-# Fire-and-forget helpers (face check, delayed notice cleanup). The event loop
-# keeps only a weak reference to a bare task, so a long download or a sleeping
-# cleanup could in theory be garbage-collected mid-flight.
-_BG_TASKS: set[asyncio.Task] = set()
-
-
-def background(coro) -> None:
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
 
 
 async def _mark_face_seen(redis: Redis, info: DialogInfo) -> None:
@@ -324,32 +312,11 @@ async def _photo_pipeline(
 
 
 # --------------------------------------------------------------------- helpers
-async def _user(session: AsyncSession, tg_id: int) -> User | None:
-    res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
-    return res.scalar_one_or_none()
-
-
 async def _delete(message: Message) -> None:
     try:
         await message.delete()
     except Exception:
         pass
-
-
-NOTICE_TTL_S = 8
-
-
-async def _notice(bot: Bot, redis: Redis, tg_id: int, text: str) -> None:
-    """Transient hint (flood, mute, ban). Self-destructs so the chat stays clean."""
-    if not await rate_limit(redis, key=keys.throttle(f"notice:{tg_id}"), ttl_s=20):
-        return
-    try:
-        msg = await safe_send_message(bot, tg_id, text)
-    except Exception:
-        logger.info("notice_failed tg=%s", tg_id)
-        return
-    if msg is not None:
-        background(_delete_later(bot, tg_id, msg.message_id, NOTICE_TTL_S))
 
 
 async def _typing(bot: Bot, redis: Redis, partner_tg: int, action: str = "typing") -> None:
@@ -364,11 +331,3 @@ async def _typing(bot: Bot, redis: Redis, partner_tg: int, action: str = "typing
         await bot.send_chat_action(chat_id=partner_tg, action=action)
     except Exception:
         logger.debug("chat_action_failed tg=%s", partner_tg)
-
-
-async def _delete_later(bot: Bot, tg_id: int, message_id: int, delay: float) -> None:
-    try:
-        await asyncio.sleep(delay)
-        await safe_delete_message(bot, tg_id, message_id)
-    except Exception:
-        logger.debug("notice_cleanup_failed tg=%s", tg_id)

@@ -75,12 +75,11 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        Index("ix_users_city", "city"),
         Index("ix_users_subscription_until", "subscription_until"),
-        Index("ix_users_season_rating_chat", "season_rating_chat"),
-        Index("ix_users_season_rating_appearance", "season_rating_appearance"),
         Index("ix_users_created_at", "created_at"),
         Index("ix_users_invited_by", "invited_by"),
+        # Premium selection sorts by these two; a single-column index on either
+        # one would just duplicate this prefix.
         Index("ix_users_premium_match", "season_rating_chat", "season_rating_appearance"),
     )
 
@@ -110,7 +109,6 @@ class Dialog(Base):
 
     __table_args__ = (
         Index("ix_dialogs_user_pair", "user1_id", "user2_id"),
-        Index("ix_dialogs_status", "status"),
         Index("ix_dialogs_status_created", "status", "created_at"),
     )
 
@@ -146,7 +144,6 @@ class Message(Base):
     dialog: Mapped[Dialog] = relationship("Dialog", back_populates="messages")
 
     __table_args__ = (
-        Index("ix_messages_dialog_id", "dialog_id"),
         Index("ix_messages_dialog_created", "dialog_id", "created_at"),
         Index("ix_messages_from_user_id", "from_user_id"),
         Index("ix_messages_created_at", "created_at"),
@@ -193,8 +190,8 @@ class Rating(Base):
 
     __table_args__ = (
         UniqueConstraint("dialog_id", "from_user_id", "to_user_id", "rating_type", name="ux_ratings_unique"),
-        Index("ix_ratings_to_user_id", "to_user_id"),
         Index("ix_ratings_dialog_id", "dialog_id"),
+        # Covers "ratings of this user of this type" — the only way they are read.
         Index("ix_ratings_seasonal_valid", "to_user_id", "rating_type", "is_seasonal_valid"),
         Index("ix_ratings_created_at", "created_at"),
     )

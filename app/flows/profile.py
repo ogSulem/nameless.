@@ -14,7 +14,7 @@ from app.database.models import User
 from app.flows.pending import clear_rating
 from app.keyboards.profile import profile_kb
 from app.services.matchmaking import MatchmakingService, normalize_seek
-from app.ui import edit_ui, send_new_ui
+from app.ui import edit_ui
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +100,6 @@ async def show_profile(
     session: AsyncSession,
     settings: Settings,
     tg_id: int,
-    *,
-    new_message: bool = False,
 ) -> None:
     res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
     user = res.scalar_one_or_none()
@@ -125,8 +123,5 @@ async def show_profile(
     kb = profile_kb(
         premium=is_premium, payments_enabled=settings.payments_enabled, premium_mode=mode
     )
-    if new_message:
-        await send_new_ui(bot, redis, tg_id, text, kb=kb)
-    else:
-        await edit_ui(bot, redis, tg_id, text, kb=kb)
+    await edit_ui(bot, redis, tg_id, text, kb=kb)
 

@@ -17,6 +17,7 @@ from app.flows.profile import show_profile
 from app.flows.states import Complaint
 from app.handlers.commands import get_user
 from app.keyboards.rating import complaint_prompt_kb, rating_kb
+from app.keyboards.start import back_kb
 from app.redis import keys
 from app.services.complaint import ComplaintService
 from app.services.rating import RatingService
@@ -145,7 +146,7 @@ async def _finish_rating(
         await start_search_for(bot, session, redis, settings, tg_id)
         return
 
-    await edit_ui(bot, redis, tg_id, "Спасибо! Возвращаемся в профиль…")
+    # Straight to the profile: an intermediate "спасибо" frame is a visible flash.
     await show_profile(bot, redis, session, settings, tg_id)
 
 
@@ -210,7 +211,6 @@ async def rate_callback(
         )
         return
 
-    await edit_ui(call.bot, redis, tg_id, "✅ Спасибо! Оценка учтена.")
     await _finish_rating(call.bot, session, redis, settings, tg_id, str(state.get("action") or "end"))
 
 
@@ -219,7 +219,6 @@ async def rate_skip(call: CallbackQuery, session: AsyncSession, redis: Redis, se
     tg_id = int(call.from_user.id)
     state = await _pending(redis, tg_id)
     await safe_answer_callback(call, "Пропущено")
-    await edit_ui(call.bot, redis, tg_id, "Ок, пропустили.")
     await _finish_rating(call.bot, session, redis, settings, tg_id, str(state.get("action") or "end"))
 
 
@@ -338,10 +337,12 @@ async def complaint_reason(
         await ComplaintService().notify_moderators(message.bot, redis, settings, created, reason)
 
     await _clear_pending(redis, tg_id)
+    # A receipt the person can look at beats a frame that flashes past on its way
+    # to the profile.
     await edit_ui(
         message.bot, redis, tg_id,
         "✅ <b>Жалоба принята</b>\n\n"
         f"Номер обращения: <code>#{created.complaint_id if created else '—'}</code>\n"
         "Модератор проверит переписку и примет решение. Спасибо, что помогаете сервису.",
+        kb=back_kb("menu:profile"),
     )
-    await show_profile(message.bot, redis, session, settings, tg_id)

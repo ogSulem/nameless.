@@ -24,9 +24,9 @@ from app.services import admin as admin_service
 from app.services.city_validator import sanitize_city
 from app.services.dialog import DialogService
 from app.services.matchmaking import MatchmakingService, seek_gender_for
-from app.telegram_safe import safe_answer_callback, safe_send_message
+from app.telegram_safe import safe_answer_callback, safe_delete_message, safe_send_message
 from app.texts import days_label, help_text, privacy_text, rules_text, terms_text
-from app.ui import edit_ui, send_new_ui
+from app.ui import edit_ui, get_ui_message_id, notice, send_new_ui
 
 logger = logging.getLogger(__name__)
 router = Router(name="commands")
@@ -388,7 +388,7 @@ async def reg_seek(
     if invited_by:
         await _pay_referral(call.bot, redis, session, settings, inviter_tg=invited_by, invitee=user)
 
-    await show_profile(call.bot, redis, session, settings, tg_id, new_message=True)
+    await show_profile(call.bot, redis, session, settings, tg_id)
     await safe_answer_callback(call, "Готово! Ищем?")
 
 
@@ -453,10 +453,16 @@ async def delete_ask(call: CallbackQuery, redis: Redis) -> None:
 @router.callback_query(F.data == "account:delete_confirm")
 async def delete_confirm(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
     tg_id = int(call.from_user.id)
+    # Purging wipes the UI pointer, so remember it first: the old screen is deleted
+    # and the farewell becomes the only message in the chat.
+    mid = await get_ui_message_id(redis, tg_id)
     await caretaker_purge(call.bot, session, redis, settings, tg_id)
+    if mid:
+        await safe_delete_message(call.bot, tg_id, mid)
     await send_new_ui(
         call.bot, redis, tg_id,
         "Профиль и данные удалены. Спасибо, что заглянули 💎\n\nНажмите /start, чтобы вернуться.",
+        delete_previous=False,
     )
     await safe_answer_callback(call, "Данные удалены")
 
@@ -695,7 +701,7 @@ async def _save_city(
     # The queue holds the old city; re-queueing under the new one avoids ghost matches.
     svc = MatchmakingService(redis, settings)
     await svc.dequeue(tg_id)
-    await show_profile(bot, redis, session, settings, tg_id, new_message=call is None)
+    await show_profile(bot, redis, session, settings, tg_id)
 
 
 @router.callback_query(F.data == "profile:seek")
@@ -735,28 +741,55 @@ async def edit_seek_choice(
 
 
 # ------------------------------------------------------------------- commands
-@router.message(Command("help"))
-async def cmd_help(message: Message, redis: Redis, settings: Settings) -> None:
+async def _info_screen(
+    bot: Bot,
+    redis: Redis,
+    session: AsyncSession,
+    settings: Settings,
+    tg_id: int,
+    text: str,
+) -> None:
+    """Show a reference text without wrecking what is currently on screen.
+
+    In a dialog the partner card must survive, and during registration the consent
+    screen must survive — there we answer with a self-deleting notice. Otherwise
+    the screen is simply edited in place: no delete, no re-send, no flicker.
+    """
+    user = await get_user(session, tg_id)
+    busy = user is not None and bool(
+        await DialogService(redis, settings).active_dialog_id(session, tg_id)
+    )
+    if user is None or busy:
+        await notice(bot, redis, tg_id, text, ttl_s=45)
+        return
+    await edit_ui(bot, redis, tg_id, text, kb=back_kb("menu:profile"))
+
+
+async def _command_info(message: Message, session: AsyncSession, redis: Redis, settings: Settings, text: str) -> None:
+    if message.from_user is None:
+        return
     await _delete(message)
-    await send_new_ui(message.bot, redis, int(message.from_user.id), help_text(settings))
+    await _info_screen(message.bot, redis, session, settings, int(message.from_user.id), text)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    await _command_info(message, session, redis, settings, help_text(settings))
 
 
 @router.message(Command("terms"))
-async def cmd_terms(message: Message, redis: Redis, settings: Settings) -> None:
-    await _delete(message)
-    await send_new_ui(message.bot, redis, int(message.from_user.id), terms_text(settings))
+async def cmd_terms(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    await _command_info(message, session, redis, settings, terms_text(settings))
 
 
 @router.message(Command("privacy"))
-async def cmd_privacy(message: Message, redis: Redis, settings: Settings) -> None:
-    await _delete(message)
-    await send_new_ui(message.bot, redis, int(message.from_user.id), privacy_text(settings))
+async def cmd_privacy(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    await _command_info(message, session, redis, settings, privacy_text(settings))
 
 
 @router.message(Command("rules"))
-async def cmd_rules(message: Message, redis: Redis) -> None:
-    await _delete(message)
-    await send_new_ui(message.bot, redis, int(message.from_user.id), rules_text())
+async def cmd_rules(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    await _command_info(message, session, redis, settings, rules_text())
 
 
 @router.message(Command("premium"))

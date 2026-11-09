@@ -17,6 +17,16 @@ from app.config import Settings  # noqa: E402
 from app.database.models import Base, Gender, User  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_render_cache():
+    """The bot remembers what each message shows; chat ids repeat across tests."""
+    from app.telegram_safe import reset_render_cache
+
+    reset_render_cache()
+    yield
+    reset_render_cache()
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(

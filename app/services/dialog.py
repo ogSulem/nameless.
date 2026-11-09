@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import Settings
 from app.database.models import ActiveDialog, Dialog, DialogStatus, Photo, User
@@ -26,6 +27,9 @@ class DialogInfo:
     partner_db_id: int
     partner_telegram_id: int
     has_photos: bool
+    # Loaded by the same query, so a relayed message needs no extra SELECT.
+    me: User | None = None
+    partner: User | None = None
 
 
 class DialogService:
@@ -48,10 +52,18 @@ class DialogService:
     # ------------------------------------------------------------------ lookup
     async def active_dialog_id(self, session: AsyncSession, telegram_id: int) -> int | None:
         tg = int(telegram_id)
-        cached = await self._cache_get_int(keys.active_dialog(tg))
+        # Read + heartbeat in one round trip: this runs for *every* relayed message.
+        cached = None
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            pipe.get(keys.active_dialog(tg))
+            pipe.expire(keys.active_dialog(tg), self.ttl_s)
+            raw, _ = await pipe.execute()
+            if raw is not None:
+                cached = int(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            cached = None
         if cached is not None:
-            # Heartbeat: an active conversation must never expire from the cache.
-            await self._touch(keys.active_dialog(tg))
             return cached
 
         res = await session.execute(
@@ -75,42 +87,44 @@ class DialogService:
         return info.dialog_id
 
     async def dialog_info(self, session: AsyncSession, dialog_id: int, my_tg: int) -> DialogInfo | None:
+        """Everything a relay needs, in **one** query.
+
+        This sits on the path of every single message; it used to take three
+        separate SELECTs (dialog, my id, partner id) in the same round trip.
+        """
+        u1 = aliased(User)
+        u2 = aliased(User)
         res = await session.execute(
-            select(Dialog.user1_id, Dialog.user2_id, Dialog.has_photos, Dialog.status).where(Dialog.id == dialog_id)
+            select(Dialog.has_photos, Dialog.status, u1, u2)
+            .select_from(Dialog)
+            .join(u1, u1.id == Dialog.user1_id)
+            .join(u2, u2.id == Dialog.user2_id)
+            .where(Dialog.id == int(dialog_id))
         )
         row = res.one_or_none()
         if row is None:
             return None
 
-        user1_id, user2_id, has_photos, status = row
+        has_photos, status, first, second = row
         if status != DialogStatus.active:
             return None
 
-        res_me = await session.execute(select(User.id).where(User.telegram_id == int(my_tg)))
-        me_db_id = res_me.scalar_one_or_none()
-        if me_db_id is None:
-            return None
-        me_db_id = int(me_db_id)
-
-        if me_db_id == int(user1_id):
-            partner_db_id = int(user2_id)
-        elif me_db_id == int(user2_id):
-            partner_db_id = int(user1_id)
+        if int(first.telegram_id) == int(my_tg):
+            me, partner = first, second
+        elif int(second.telegram_id) == int(my_tg):
+            me, partner = second, first
         else:
-            return None
-
-        res_p = await session.execute(select(User.telegram_id).where(User.id == partner_db_id))
-        partner_tg = res_p.scalar_one_or_none()
-        if partner_tg is None:
             return None
 
         return DialogInfo(
             dialog_id=int(dialog_id),
-            me_db_id=me_db_id,
-            me_telegram_id=int(my_tg),
-            partner_db_id=partner_db_id,
-            partner_telegram_id=int(partner_tg),
+            me_db_id=int(me.id),
+            me_telegram_id=int(me.telegram_id),
+            partner_db_id=int(partner.id),
+            partner_telegram_id=int(partner.telegram_id),
             has_photos=bool(has_photos),
+            me=me,
+            partner=partner,
         )
 
     async def partner_telegram_id(self, session: AsyncSession, dialog_id: int, my_tg: int) -> int | None:

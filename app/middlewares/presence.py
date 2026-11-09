@@ -53,17 +53,12 @@ class PresenceMiddleware(BaseMiddleware):
         user = _from_user(event)
         if user is not None and not getattr(user, "is_bot", False):
             tg_id = int(user.id)
+            # One round trip instead of two: this runs on *every* update.
             try:
-                await self._redis.set(
-                    keys.online_key(tg_id), "1", ex=int(self._settings.online_ttl_s)
-                )
-            except Exception:
-                pass
-
-            try:
-                fresh = await self._redis.set(
-                    keys.seen_key(tg_id), "1", nx=True, ex=TOUCH_EVERY_S
-                )
+                pipe = self._redis.pipeline(transaction=False)
+                pipe.set(keys.online_key(tg_id), "1", ex=int(self._settings.online_ttl_s))
+                pipe.set(keys.seen_key(tg_id), "1", nx=True, ex=TOUCH_EVERY_S)
+                _, fresh = await pipe.execute()
             except Exception:
                 fresh = False
 
