@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, Update
 from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
@@ -30,9 +30,10 @@ class DedupeMiddleware(BaseMiddleware):
 
         try:
             if not await self._redis.set(key, "1", nx=True, ex=self._ttl):
-                if isinstance(event, CallbackQuery):
+                callback = event.callback_query if isinstance(event, Update) else event
+                if isinstance(callback, CallbackQuery):
                     try:
-                        await event.answer()
+                        await callback.answer()
                     except Exception:
                         pass
                 return None
@@ -43,6 +44,14 @@ class DedupeMiddleware(BaseMiddleware):
 
     @staticmethod
     def _key(event: Any) -> str | None:
+        """The dispatcher hands us whole `Update` objects, so `update_id` is the key.
+
+        It used to look for `CallbackQuery`/`Message` instances that never arrive
+        at this level, which made the middleware a silent no-op: a retried
+        getUpdates batch could relay the same message twice.
+        """
+        if isinstance(event, Update):
+            return f"dedupe:upd:{event.update_id}"
         if isinstance(event, CallbackQuery):
             user = getattr(event, "from_user", None)
             if user is None:
