@@ -304,3 +304,18 @@ async def test_edited_message_tells_the_sender_it_was_not_relayed(bot, dispatche
     assert not [m for m in bot.session.sent if isinstance(m, CopyMessage)], "edits must not be relayed"
     notices = [m for m in bot.session.sent if isinstance(m, SendMessage)]
     assert notices and "заново" in (notices[-1].text or "")
+
+
+@pytest.mark.asyncio
+async def test_a_notice_does_not_swallow_a_different_notice(bot, dispatcher, session, redis, make_user):
+    """Per-kind throttle: a rate-limit hint must not hide the delivery failure."""
+    from app.ui import notice
+
+    await make_user(9901)
+    await notice(bot, redis, 9901, "⏳ Слишком быстро.")
+    await notice(bot, redis, 9901, "Сообщение не доставлено.")
+    await notice(bot, redis, 9901, "⏳ Слишком быстро.")
+
+    texts = [m.text for m in bot.session.sent if isinstance(m, SendMessage)]
+    assert sum("Слишком быстро" in (t or "") for t in texts) == 1
+    assert any("не доставлено" in (t or "") for t in texts)

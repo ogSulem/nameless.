@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 
 from aiogram import Bot
@@ -41,9 +42,16 @@ async def notice(
     ttl_s: float = NOTICE_TTL_S,
     throttle_s: int = 20,
 ) -> None:
-    """A transient line that deletes itself, so the main screen stays untouched."""
+    """A transient line that deletes itself, so the main screen stays untouched.
+
+    The throttle is per *kind* of notice: "слишком быстро" must not swallow the
+    "сообщение не доставлено" that follows it a second later.
+    """
+    kind = hashlib.blake2s(text.encode("utf-8", "ignore"), digest_size=4).hexdigest()
     try:
-        fresh = await redis.set(keys.throttle(f"notice:{int(tg_id)}"), "1", nx=True, ex=int(throttle_s))
+        fresh = await redis.set(
+            keys.throttle(f"notice:{int(tg_id)}:{kind}"), "1", nx=True, ex=int(throttle_s)
+        )
     except Exception:
         fresh = True
     if not fresh:
