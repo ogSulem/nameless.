@@ -266,3 +266,41 @@ async def test_going_back_home_abandons_the_unfinished_flow(bot, dispatcher, ses
     assert await dispatcher.storage.get_state(key) == "ProfileEdit:city"
     await press(bot, dispatcher, tg, "menu:profile")
     assert await dispatcher.storage.get_state(key) is None
+
+
+@pytest.mark.asyncio
+async def test_edited_message_tells_the_sender_it_was_not_relayed(bot, dispatcher, session, make_user):
+    """The partner must not sit with stale text, and silence is not an answer."""
+    from datetime import UTC, datetime
+
+    from aiogram.types import Chat, Message, Update
+    from aiogram.types import User as TgUser
+
+    from app.database.models import Gender
+
+    for tg, gender in ((9801, Gender.male), (9802, Gender.female)):
+        await make_user(tg, gender=gender, city=None)
+        await send_text(bot, dispatcher, tg, "/start")
+    await press(bot, dispatcher, 9801, "search:start")
+    await press(bot, dispatcher, 9802, "search:start")
+    await send_text(bot, dispatcher, 9801, "превет")
+    bot.session.sent.clear()
+
+    update = Update(
+        update_id=999001,
+        edited_message=Message(
+            message_id=999002,
+            date=datetime.now(tz=UTC),
+            edit_date=int(datetime.now(tz=UTC).timestamp()),
+            chat=Chat(id=9801, type="private"),
+            from_user=TgUser(id=9801, is_bot=False, first_name="U9801"),
+            text="привет",
+        ).as_(bot),
+    )
+    await dispatcher.feed_update(bot, update)
+
+    from aiogram.methods import CopyMessage, SendMessage
+
+    assert not [m for m in bot.session.sent if isinstance(m, CopyMessage)], "edits must not be relayed"
+    notices = [m for m in bot.session.sent if isinstance(m, SendMessage)]
+    assert notices and "заново" in (notices[-1].text or "")

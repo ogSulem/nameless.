@@ -32,6 +32,12 @@ def days_label(days: int) -> str:
     return f"{days} дн."
 
 
+def _referral_reward(settings: Settings) -> str:
+    """Say what the reward actually is — the number is configurable."""
+    days = int(settings.referral_reward_days)
+    return f"{days_label(days)} Premium" if days > 0 else "бонусные дни Premium"
+
+
 def terms_text(settings: Settings) -> str:
     operator = settings.operator_name or "администрация сервиса"
     contact = settings.support_contact or "через бота"
@@ -121,8 +127,8 @@ def help_text(settings: Settings) -> str:
         "4. «⏭️ Следующий» — завершить диалог и сразу искать нового.\n"
         "   «🛑 Завершить» — выйти в профиль.\n"
         "5. «🎁 Позвать друга» — за каждого нового друга, который зарегистрируется "
-        "по вашей ссылке, вы получаете месяц Premium. «🎟 Промокод» — активировать "
-        "код на бесплатные дни.\n"
+        f"по вашей ссылке, вы получаете {_referral_reward(settings)} Premium. "
+        "«🎟 Промокод» — активировать код на бесплатные дни.\n"
         "6. После диалога оцените общение (1–10) и, если собеседник присылал фото "
         "человека, — внешность. Оценки анонимны.\n\n"
         "<b>Команды</b>\n"

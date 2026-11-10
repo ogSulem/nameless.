@@ -316,6 +316,27 @@ async def _photo_pipeline(
         logger.exception("photo_pipeline_failed dialog_id=%s", info.dialog_id)
 
 
+@router.edited_message()
+async def edited_message(message: Message, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    """Edits are not relayed — say so instead of leaving the partner with stale text."""
+    if message.from_user is None:
+        return
+    tg_id = int(message.from_user.id)
+    svc = DialogService(redis, settings)
+    dialog_id = await svc.active_dialog_id(session, tg_id)
+    if not dialog_id:
+        return
+    info = await svc.dialog_info(session, dialog_id, tg_id)
+    if info is None:
+        return
+    await notice(
+        message.bot,
+        redis,
+        tg_id,
+        "Исправления не доходят до собеседника — отправьте сообщение заново.",
+    )
+
+
 # --------------------------------------------------------------------- helpers
 async def _delete(message: Message) -> None:
     try:
