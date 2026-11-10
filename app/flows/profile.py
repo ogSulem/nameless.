@@ -1,83 +1,129 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import UTC, date, datetime
+from html import escape
 
 from aiogram import Bot
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.database.models import User
+from app.flows.pending import clear_rating
 from app.keyboards.profile import profile_kb
-from app.redis import keys
+from app.services.matchmaking import MatchmakingService, normalize_seek
 from app.ui import edit_ui
 
-
-def _fmt_sub_until(until: datetime | None) -> str:
-    if until is None:
-        return "нет"
-    dt = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
-    active = dt > datetime.now(tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M") + (" (active)" if active else " (expired)")
+logger = logging.getLogger(__name__)
 
 
-async def show_profile(bot: Bot, redis: Redis, session: AsyncSession, tg_id: int) -> None:
-    cached = None
+def age_of(birth_date: date) -> int:
+    today = datetime.now(tz=UTC).date()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+
+
+def birth_date_from_age(age: int) -> date:
+    """Turn the age a person typed into a birth date.
+
+    Registration asks for the age (that is the number the product shows), but the
+    column stays a real date, so the stored age keeps moving with the calendar
+    instead of freezing on the day of sign-up. 29 Feb degrades to 28 Feb in
+    non-leap years.
+    """
+    today = datetime.now(tz=UTC).date()
     try:
-        cached = await redis.get(keys.profile_text(tg_id))
-    except Exception:
-        cached = None
-    if isinstance(cached, bytes):
-        try:
-            cached = cached.decode("utf-8", errors="replace")
-        except Exception:
-            cached = None
-    if isinstance(cached, str) and cached.strip():
-        await edit_ui(bot, redis, tg_id, cached, kb=profile_kb())
-        return
+        return today.replace(year=today.year - int(age))
+    except ValueError:
+        return date(today.year - int(age), 2, 28)
 
-    res = await session.execute(select(User).where(User.telegram_id == tg_id))
-    user = res.scalar_one_or_none()
+
+def premium_active(user: User) -> bool:
+    if user.subscription_until is None:
+        return False
+    until = user.subscription_until
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return until > datetime.now(tz=UTC)
+
+
+def rating_line(user: User) -> str:
+    if int(user.chat_ratings_count or 0) == 0:
+        return "⭐ Рейтинг общения: <i>новый пользователь</i>"
+    line = f"⭐ Рейтинг общения: <b>{float(user.season_rating_chat or 0):.1f}</b>/10"
+    if int(user.appearance_ratings_count or 0) > 0:
+        line += f" · внешность: <b>{float(user.season_rating_appearance or 0):.1f}</b>/10"
+    return line
+
+
+SEEK_LABELS = {"male": "👦 парней", "female": "👧 девушек", "any": "🤷 не важно"}
+
+
+def seek_label(user: User) -> str:
+    value = normalize_seek(user.seek_gender, getattr(user.gender, "value", user.gender))
+    return SEEK_LABELS[value]
+
+
+def profile_text(user: User, settings: Settings, premium_mode: str = "chat") -> str:
+    gender_value = getattr(user.gender, "value", user.gender)
+    gender = "👦 парень" if gender_value == "male" else "👧 девушка"
+    city = escape(user.city) if user.city else "🌍 вся страна"
+    is_premium = premium_active(user)
+
+    lines = [
+        f"<b>👤 Профиль</b>{' 💎' if is_premium else ''}",
+        "",
+        f"Пол: {gender}",
+        f"Возраст: {age_of(user.birth_date)}",
+        f"Город: {city}",
+        f"Ищу: {seek_label(user)}",
+        rating_line(user),
+    ]
+    if is_premium and user.subscription_until is not None:
+        until = user.subscription_until
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=UTC)
+        mode_label = "внешность" if premium_mode == "appearance" else "общение"
+        lines.append(f"💎 Premium до <b>{until:%d.%m.%Y}</b> · подбор по: <b>{mode_label}</b>")
+    elif settings.payments_enabled:
+        lines.append("💎 Premium: собеседники с высоким рейтингом и приоритет в подборе")
+
+    if user.is_banned:
+        lines = ["🚫 <b>Аккаунт заблокирован.</b>", "", "Если вы считаете это ошибкой — напишите в поддержку."]
+    return "\n".join(lines)
+
+
+async def show_profile(
+    bot: Bot,
+    redis: Redis,
+    session: AsyncSession,
+    settings: Settings,
+    tg_id: int,
+    user: User | None = None,
+) -> None:
     if user is None:
-        await edit_ui(bot, redis, tg_id, "Сначала запусти /start")
+        res = await session.execute(select(User).where(User.telegram_id == int(tg_id)))
+        user = res.scalar_one_or_none()
+    if user is None:
+        await edit_ui(bot, redis, tg_id, "Нажмите /start, чтобы начать.")
         return
 
-    gender = "М" if user.gender.value == "male" else "Ж"
-    age = None
-    if user.birth_date:
-        today = datetime.now(tz=timezone.utc).date()
-        age = today.year - user.birth_date.year - (
-            (today.month, today.day) < (user.birth_date.month, user.birth_date.day)
-        )
+    # Showing the profile means "not rating anymore": the 1–10 screen is gone,
+    # so a typed number must not be treated as an anonymous rating.
+    await clear_rating(redis, tg_id)
 
-    city = user.city or "🌍 глобально"
-    sub = _fmt_sub_until(user.subscription_until)
-    is_premium = False
-    if user.subscription_until:
-        until_dt = user.subscription_until if user.subscription_until.tzinfo else user.subscription_until.replace(tzinfo=timezone.utc)
-        is_premium = until_dt > datetime.now(tz=timezone.utc)
-    
-    chat_r = float(user.season_rating_chat or 0.0)
-    app_r = float(user.season_rating_appearance or 0.0)
-    rating_line = f"Рейтинг: {chat_r:.1f}"
-    if app_r > 0:
-        rating_line += f" / {app_r:.1f}"
+    is_premium = premium_active(user)
+    mode = "chat"
+    if is_premium:
+        try:
+            mode = await MatchmakingService(redis, settings).premium_mode(int(tg_id))
+        except Exception:
+            mode = "chat"
 
-    text = "\n".join(
-        [
-            "👤 *Профиль*" + (" 💎" if is_premium else ""),
-            f"Пол: {gender}",
-            f"Возраст: {age if age is not None else '-'}",
-            f"Город: {city}",
-            rating_line,
-            f"Premium: {sub}\n",
-            "💎 С Premium попадаются собеседники с рейтингом 7+" if not is_premium else "💎 У вас активен Premium статус!",
-        ]
+    text = profile_text(user, settings, premium_mode=mode)
+    kb = profile_kb(
+        premium=is_premium, payments_enabled=settings.payments_enabled, premium_mode=mode
     )
+    await edit_ui(bot, redis, tg_id, text, kb=kb)
 
-    try:
-        await redis.set(keys.profile_text(tg_id), text, ex=10)
-    except Exception:
-        pass
-
-    await edit_ui(bot, redis, tg_id, text, kb=profile_kb())

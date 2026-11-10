@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,12 +18,12 @@ class SubscriptionService:
         if user is None:
             return None
 
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         base = user.subscription_until
         if base is None:
             base_dt = now
         else:
-            base_dt = base if base.tzinfo else base.replace(tzinfo=timezone.utc)
+            base_dt = base if base.tzinfo else base.replace(tzinfo=UTC)
             if base_dt < now:
                 base_dt = now
 

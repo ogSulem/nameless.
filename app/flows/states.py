@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from aiogram.fsm.state import State, StatesGroup
+
+
+class Registration(StatesGroup):
+    consent = State()
+    gender = State()
+    age = State()
+    city = State()
+    seek = State()
+
+
+class ProfileEdit(StatesGroup):
+    city = State()
+    seek = State()
+
+
+class Complaint(StatesGroup):
+    reason = State()
+
+
+class AdminPanel(StatesGroup):
+    waiting_user_id = State()
+    waiting_promo = State()
+
+
+class Promo(StatesGroup):
+    waiting_code = State()
+
+
+class Payment(StatesGroup):
+    waiting_email = State()

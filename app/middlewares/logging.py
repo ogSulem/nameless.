@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import Update
@@ -11,70 +12,34 @@ from app.logging.context import clear_update_id, set_update_id
 from app.metrics import record_update
 
 logger = logging.getLogger(__name__)
+SLOW_MS = 1000.0
+
 
 class LoggingMiddleware(BaseMiddleware):
     async def __call__(
         self,
-        handler: Callable[[Update, Dict[str, Any]], Awaitable[Any]],
+        handler: Callable[[Update, dict[str, Any]], Awaitable[Any]],
         event: Update,
-        data: Dict[str, Any],
+        data: dict[str, Any],
     ) -> Any:
-        start_time = time.perf_counter()
+        started = time.perf_counter()
         update_id = event.update_id
-        
-        # Inject correlation ID into data for handlers to use if needed
-        data["update_id"] = update_id
-        
-        user = getattr(event.event, "from_user", None)
-        user_id = user.id if user else "unknown"
-        
-        event_type = "unknown"
-        if event.message:
-            if event.message.successful_payment:
-                event_type = "successful_payment"
-            else:
-                event_type = "message"
-        elif event.callback_query:
-            event_type = "callback_query"
-        elif event.pre_checkout_query:
-            event_type = "pre_checkout_query"
-        elif event.channel_post:
-            event_type = "channel_post"
-
         set_update_id(update_id)
-        logger.info(
-            "update_start update_id=%s user_id=%s type=%s",
-            update_id,
-            user_id,
-            event_type
-        )
-        
+
+        ok = True
         try:
-            result = await handler(event, data)
-            duration = (time.perf_counter() - start_time) * 1000
-            try:
-                await record_update(ok=True, duration_ms=duration, slow=duration >= 1500)
-            except Exception:
-                pass
-            logger.info(
-                "update_end update_id=%s user_id=%s duration_ms=%.2f",
-                update_id,
-                user_id,
-                duration
-            )
-            return result
+            return await handler(event, data)
         except Exception:
-            duration = (time.perf_counter() - start_time) * 1000
-            try:
-                await record_update(ok=False, duration_ms=duration, slow=duration >= 1500)
-            except Exception:
-                pass
-            logger.error(
-                "update_failed update_id=%s user_id=%s duration_ms=%.2f",
-                update_id,
-                user_id,
-                duration
-            )
+            ok = False
             raise
         finally:
+            duration_ms = (time.perf_counter() - started) * 1000
+            try:
+                await record_update(ok=ok, duration_ms=duration_ms, slow=duration_ms >= SLOW_MS)
+            except Exception:
+                pass
+            if ok:
+                logger.debug("update_ok update_id=%s duration_ms=%.1f", update_id, duration_ms)
+            else:
+                logger.error("update_failed update_id=%s duration_ms=%.1f", update_id, duration_ms)
             clear_update_id()

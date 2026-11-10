@@ -3,11 +3,63 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def profile_kb() -> InlineKeyboardMarkup:
+def profile_kb(
+    *,
+    premium: bool,
+    payments_enabled: bool,
+    premium_mode: str = "chat",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔎 Найти собеседника", callback_data="search:start")],
+    ]
+    if payments_enabled and not premium:
+        rows.append([InlineKeyboardButton(text="💎 Premium — подписка", callback_data="pay:premium")])
+    if premium:
+        mode_label = "внешность" if premium_mode == "appearance" else "общение"
+        premium_row = [
+            InlineKeyboardButton(text=f"💎 Подбор: {mode_label}", callback_data="premium:mode")
+        ]
+        if payments_enabled:
+            premium_row.append(InlineKeyboardButton(text="💎 Продлить", callback_data="pay:premium"))
+        rows.append(premium_row)
+    rows.append(
+        [
+            InlineKeyboardButton(text="🏙 Город", callback_data="profile:city"),
+            InlineKeyboardButton(text="👀 Кого ищем", callback_data="profile:seek"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="🎁 Позвать друга", callback_data="menu:invite"),
+            InlineKeyboardButton(text="🎟 Промокод", callback_data="menu:promo"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help"),
+            InlineKeyboardButton(text="⚙️ Данные", callback_data="menu:legal"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def legal_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Поиск", callback_data="search")],
-            [InlineKeyboardButton(text="💎 Оплатить Premium", callback_data="menu_premium")],
-            [InlineKeyboardButton(text="🏙 Поменять город", callback_data="profile_change_city")],
+            [
+                InlineKeyboardButton(text="📄 Условия", callback_data="legal:terms"),
+                InlineKeyboardButton(text="🔒 Политика данных", callback_data="legal:privacy"),
+            ],
+            [InlineKeyboardButton(text="🗑 Удалить профиль и переписку", callback_data="account:delete_ask")],
+            [InlineKeyboardButton(text="← Назад", callback_data="menu:profile")],
+        ]
+    )
+
+
+def delete_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить всё", callback_data="account:delete_confirm")],
+            [InlineKeyboardButton(text="← Отмена", callback_data="menu:legal")],
         ]
     )

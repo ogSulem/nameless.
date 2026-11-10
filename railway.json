@@ -1,21 +1,15 @@
 {
-  "version": 2,
-  "name": "anonymous-chat-bot",
-  "services": {
-    "bot": {
-      "source": ".",
-      "healthcheck": {
-        "test": "python3 -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('PORT','8080'), timeout=3).read(); print('ok')\"",
-        "interval": "30s",
-        "timeout": "5s",
-        "retries": 3,
-        "startPeriod": "10s"
-      },
-      "variables": {
-        "PYTHONUNBUFFERED": "1",
-        "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
-        "REDIS_URL": "${{Redis.REDIS_URL}}"
-      }
-    }
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/healthz",
+    "healthcheckTimeout": 120,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "drainingSeconds": 20
   }
 }

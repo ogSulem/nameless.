@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextvars
 import logging
 
-
 _update_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("update_id", default=None)
 
 

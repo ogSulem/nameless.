@@ -3,89 +3,71 @@ from __future__ import annotations
 import hashlib
 import logging
 import traceback
-from typing import Any, Awaitable, Callable, Dict
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import BaseMiddleware
 
 from app.telegram_safe import safe_send_message
 
-
 logger = logging.getLogger(__name__)
 
 
 class ErrorBoundaryMiddleware(BaseMiddleware):
+    """Catch everything, log with correlation id, alert admins — without user content.
+
+    The previous version forwarded the *text of the failed message* to the alert
+    chat. That is a copy of private correspondence leaving the system on every
+    crash, so now only the exception type, place and ids are reported.
+    """
+
     def __init__(self, settings, redis) -> None:
         self._settings = settings
         self._redis = redis
 
     async def __call__(
         self,
-        handler: Callable[[Any, Dict[str, Any]], Awaitable[Any]],
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
         event: Any,
-        data: Dict[str, Any],
+        data: dict[str, Any],
     ) -> Any:
         try:
             return await handler(event, data)
         except Exception:
             logger.exception("unhandled_event_error")
 
-            alerts_chat_id = getattr(self._settings, "alerts_chat_id", None)
-            if not alerts_chat_id:
+            targets = getattr(self._settings, "alerts_target_ids", frozenset())
+            if not targets:
                 return None
 
-            # Throttle alerts to avoid spam loops
             try:
-                tb_full = traceback.format_exc()
-                tail = tb_full[-500:].encode("utf-8", errors="ignore")
-                digest = hashlib.sha256(tail).hexdigest()[:16]
-                throttle_key = f"alerts:error_throttle:{digest}"
-                if await self._redis.get(throttle_key):
+                tb = traceback.format_exc()
+                digest = hashlib.sha256(tb[-500:].encode("utf-8", "ignore")).hexdigest()[:16]
+                throttle_key = f"alerts:err:{digest}"
+                if not await self._redis.set(throttle_key, "1", nx=True, ex=300):
                     return None
-                await self._redis.set(throttle_key, "1", ex=300)
             except Exception:
-                tb_full = "traceback_failed"
+                tb = traceback.format_exc(limit=8)
 
-            try:
-                bot = data.get("bot")
-                if bot is None:
-                    bot = getattr(event, "bot", None)
-                if bot is None:
-                    logger.warning("error_boundary: bot instance not found in event or data")
-                    return None
+            bot = data.get("bot") or getattr(event, "bot", None)
+            if bot is None:
+                return None
 
-                from_user = getattr(event, "from_user", None)
-                chat = getattr(event, "chat", None)
-                text = getattr(event, "text", None)
-                data_str = getattr(event, "data", None)
-
-                who = None
-                if from_user is not None:
-                    who = f"tg={getattr(from_user, 'id', None)}"
-                if chat is not None:
-                    who = (who + " " if who else "") + f"chat={getattr(chat, 'id', None)}"
-
-                head = f"*UNHANDLED ERROR*\n{who or ''}".strip()
-
-                payload = ""
-                if isinstance(text, str) and text:
-                    payload = f"text={text!r}"
-                elif isinstance(data_str, str) and data_str:
-                    payload = f"data={data_str!r}"
-
-                tb = tb_full if tb_full != "traceback_failed" else traceback.format_exc(limit=8)
-                msg = "\n".join([head, payload, "```", tb[-3500:], "```"])
-                if len(msg) > 3900:
-                    msg = msg[:3900]
-
-                logger.info("error_boundary: sending alert to %s", alerts_chat_id)
-                await safe_send_message(
-                    bot,
-                    int(alerts_chat_id),
-                    msg,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.exception("failed_send_alert alerts_chat_id=%s error=%s", alerts_chat_id, e)
-
+            user = getattr(event, "from_user", None)
+            who = f"tg={getattr(user, 'id', None)}" if user is not None else "tg=?"
+            msg = "\n".join(
+                [
+                    "*UNHANDLED ERROR*",
+                    who,
+                    "",
+                    "```",
+                    tb[-2500:],
+                    "```",
+                ]
+            )
+            for target in targets:
+                try:
+                    await safe_send_message(bot, int(target), msg[:3900], parse_mode="Markdown")
+                except Exception:
+                    logger.warning("error_alert_failed target=%s", target)
             return None

@@ -42,7 +42,6 @@ services:
         condition: service_healthy
     volumes:
       - ./logs:/app/logs
-      - ./media:/app/media
 
 volumes:
   pgdata:
