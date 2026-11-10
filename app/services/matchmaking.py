@@ -175,6 +175,31 @@ class MatchmakingService:
             total += await self.queue_size(target, None)
         return total
 
+    async def prune_queues(self, max_age_s: int | None = None) -> int:
+        """Forget people who stopped being reachable long ago.
+
+        A queue member is dropped lazily when someone scans past it, so a
+        city/gender queue that nobody searches again keeps its ghosts for years.
+        The sweeper calls this to keep Redis flat.
+        """
+        ttl = int(max_age_s or 2 * int(self._settings.online_ttl_s))
+        cutoff = f"({datetime.now(tz=UTC).timestamp() - ttl}"
+        removed = 0
+        try:
+            async for raw_key in self._redis.scan_iter(match=keys.QUEUE_SCAN, count=200):
+                name = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+                if name.startswith("v2:queue:member:"):
+                    continue
+                try:
+                    removed += int(await self._redis.zremrangebyscore(name, "-inf", cutoff))
+                except Exception:
+                    logger.debug("queue_prune_skipped key=%s", name, exc_info=True)
+        except Exception:
+            logger.warning("queue_prune_failed", exc_info=True)
+        if removed:
+            logger.info("queue_pruned members=%s", removed)
+        return removed
+
     async def queue_size(self, gender: str, city: str | None = None) -> int:
         """How many people are waiting for this gender right now."""
         try:

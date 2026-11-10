@@ -402,19 +402,26 @@ async def reg_seek(
 
 # ------------------------------------------------------------------ main menu
 @router.callback_query(F.data == "menu:profile")
-async def menu_profile(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+async def menu_profile(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    # Coming home abandons whatever half-finished flow was running: otherwise the
+    # next message the person types is eaten as a city / promo code / e-mail.
+    await state.clear()
     await show_profile(call.bot, redis, session, settings, int(call.from_user.id))
     await safe_answer_callback(call)
 
 
 @router.callback_query(F.data == "menu:help")
-async def menu_help(call: CallbackQuery, redis: Redis, settings: Settings) -> None:
+async def menu_help(call: CallbackQuery, state: FSMContext, redis: Redis, settings: Settings) -> None:
+    await state.clear()
     await edit_ui(call.bot, redis, int(call.from_user.id), help_text(settings), kb=back_kb())
     await safe_answer_callback(call)
 
 
 @router.callback_query(F.data == "menu:legal")
-async def menu_legal(call: CallbackQuery, redis: Redis) -> None:
+async def menu_legal(call: CallbackQuery, state: FSMContext, redis: Redis) -> None:
+    await state.clear()
     await edit_ui(
         call.bot, redis, int(call.from_user.id),
         "<b>⚙️ Данные и документы</b>\n\n"
@@ -428,6 +435,8 @@ async def menu_legal(call: CallbackQuery, redis: Redis) -> None:
 async def legal_docs(
     call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
 ) -> None:
+    # Deliberately keeps the FSM state: the consent screen links here, and
+    # "← К регистрации" must find the flow it came from.
     what = call.data.rsplit(":", 1)[-1]
     if what not in {"terms", "privacy"}:
         await safe_answer_callback(call)
@@ -635,8 +644,9 @@ async def cmd_invite(
 
 @router.callback_query(F.data == "menu:invite")
 async def menu_invite(
-    call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, redis: Redis, settings: Settings
 ) -> None:
+    await state.clear()
     await _invite_screen(call.bot, redis, session, settings, int(call.from_user.id))
     await safe_answer_callback(call)
 

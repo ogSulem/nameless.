@@ -4,6 +4,10 @@ CITY_GLOBAL = "global"
 
 
 # ----------------------------------------------------------------- queues (v2)
+# Pattern for the maintenance sweep; `queue_member_key` shares the prefix.
+QUEUE_SCAN = "v2:queue:*"
+
+
 def queue_key(gender: str, city: str | None) -> str:
     city_part = (city or CITY_GLOBAL).strip().lower().replace(" ", "_")
     return f"v2:queue:{gender}:{city_part}"

@@ -238,3 +238,31 @@ async def test_stale_rating_tap_lands_on_the_profile(bot, dispatcher, session, m
     live = bot.session.live_text(9601)
     assert "👤 Профиль" in live, live
     assert "неактуальна" not in live
+
+
+@pytest.mark.asyncio
+async def test_going_back_home_abandons_the_unfinished_flow(bot, dispatcher, session, make_user):
+    """Opening a promo/city screen and going home must not eat the next message."""
+    from aiogram.fsm.storage.base import StorageKey
+
+    from app.database.models import Gender
+
+    tg = 9701
+    await make_user(tg, gender=Gender.male, city="Москва")
+    await send_text(bot, dispatcher, tg, "/start")
+    key = StorageKey(bot_id=bot.id, chat_id=tg, user_id=tg)
+
+    await press(bot, dispatcher, tg, "menu:promo")
+    assert await dispatcher.storage.get_state(key) == "Promo:waiting_code"
+
+    await press(bot, dispatcher, tg, "menu:profile")
+    assert await dispatcher.storage.get_state(key) is None, "the flow must be dropped"
+
+    await send_text(bot, dispatcher, tg, "привет")
+    assert "Промокод" not in bot.session.last_text()
+
+    # Same for the city editor.
+    await press(bot, dispatcher, tg, "profile:city")
+    assert await dispatcher.storage.get_state(key) == "ProfileEdit:city"
+    await press(bot, dispatcher, tg, "menu:profile")
+    assert await dispatcher.storage.get_state(key) is None

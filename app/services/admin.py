@@ -263,9 +263,10 @@ async def user_card(
     if muted_until and muted_until > utcnow():
         flags.append(f"🔇 Мут до {muted_until:%H:%M}")
 
+    age_word = _plural(int(age), "год", "года", "лет") if age != "?" else "лет"
     lines = [
         f"👤 <b>ID</b> <code>{user.telegram_id}</code> · db#{user.id}",
-        f"🚻 {'М' if user.gender == 'male' else 'Ж'} · {age} лет",
+        f"🚻 {'М' if user.gender == 'male' else 'Ж'} · {age} {age_word}",
         f"📍 {escape(user.city or 'вся страна')}",
         f"🔎 Ищет: {escape(intent or '—')}",
         f"⭐ Рейтинг: <b>{user.season_rating_chat:.2f}</b> "

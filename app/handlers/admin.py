@@ -109,7 +109,10 @@ async def show_admin_menu(
 
 
 @router.callback_query(F.data == "adm:menu")
-async def adm_menu(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+async def adm_menu(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
+    await state.clear()
     await show_admin_menu(call.bot, redis, session, settings, int(call.from_user.id), call=call)
     await safe_answer_callback(call)
 

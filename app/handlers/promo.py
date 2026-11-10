@@ -119,6 +119,7 @@ async def menu_promo(
 ) -> None:
     if call.from_user is None:
         return
+    await state.clear()
     await state.set_state(Promo.waiting_code)
     await edit_ui(call.bot, redis, int(call.from_user.id), PROMPT)
     await safe_answer_callback(call)

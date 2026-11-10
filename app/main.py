@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 LOCK_KEY = "lock:singleton:bot"
 LOCK_TTL_S = 30
+FSM_TTL_S = 3600
 SWEEP_INTERVAL_S = 300
 RETENTION_INTERVAL_S = 3600
 
@@ -155,6 +156,9 @@ async def sweeper_loop(settings: Settings, redis: Redis, session_factory, bot: B
             if closed:
                 await _notify_expired_dialogs(bot, redis, session_factory, settings, closed)
 
+            # Queues self-heal only when somebody scans them; sweep the rest.
+            await MatchmakingService(redis, settings).prune_queues()
+
             now = asyncio.get_running_loop().time()
             if now - last_retention >= RETENTION_INTERVAL_S:
                 last_retention = now
@@ -245,7 +249,9 @@ async def run() -> int:
     except Exception:
         logger.exception("health_server_start_failed port=%s", settings.port)
 
-    storage = RedisStorage(redis=redis)
+    # Without a TTL every person who ever opened a flow leaves FSM keys in Redis
+    # forever. An hour is far longer than any flow here takes.
+    storage = RedisStorage(redis=redis, state_ttl=FSM_TTL_S, data_ttl=FSM_TTL_S)
     dp = Dispatcher(storage=storage)
 
     dp.update.middleware(LoggingMiddleware())

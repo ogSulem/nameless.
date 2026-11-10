@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -82,8 +83,11 @@ async def start_search_for(
 
 
 @router.callback_query(F.data == "search:start")
-async def search_start(call: CallbackQuery, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+async def search_start(
+    call: CallbackQuery, state: FSMContext, session: AsyncSession, redis: Redis, settings: Settings
+) -> None:
     tg_id = int(call.from_user.id)
+    await state.clear()
     if not await rate_limit(redis, key=keys.rate(f"search:{tg_id}"), ttl_s=2):
         await safe_answer_callback(call, "Секунду…")
         return

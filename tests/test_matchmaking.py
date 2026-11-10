@@ -297,3 +297,29 @@ async def test_premium_scan_batches_its_db_queries(session, engine, redis, setti
 
     assert result is not None
     assert len(selects) <= 8, f"too many queries for one match: {len(selects)}"
+
+
+@pytest.mark.asyncio
+async def test_stale_queue_members_are_swept(settings, redis, make_user, session):
+    """Queues self-heal only when scanned: the sweeper must drop the rest."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.redis import keys
+    from app.services.matchmaking import MatchmakingService
+
+    svc = MatchmakingService(redis, settings)
+    await make_user(7101, gender=Gender.male, city="Москва")
+    await make_user(7102, gender=Gender.male, city="Москва")
+    qkey = keys.queue_key("male", "Москва")
+    old = (datetime.now(tz=UTC) - timedelta(hours=5)).timestamp()
+    fresh = datetime.now(tz=UTC).timestamp()
+    await redis.zadd(qkey, {"7101": old, "7102": fresh})
+    await redis.set(keys.queue_member_key(7101), "male|москва", ex=60)
+
+    removed = await svc.prune_queues()
+
+    assert removed == 1
+    assert await redis.zscore(qkey, "7102") is not None
+    assert await redis.zscore(qkey, "7101") is None
+    # The metadata key is not a queue and must survive the scan.
+    assert await redis.get(keys.queue_member_key(7101)) == "male|москва"
